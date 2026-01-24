@@ -7,7 +7,6 @@
 # ///
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -81,8 +80,42 @@ def get_diff():
     return diff, "all"
 
 
+MAX_DIFF_CHARS = 20000
+MAX_LINES_PER_FILE = 30
+
+
+def compress_diff(diff):
+    stat, _ = run(["git", "diff", "--cached", "--stat"])
+    files_patches = []
+    current_file = None
+    current_lines = []
+    line_count = 0
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            if current_file:
+                files_patches.append((current_file, current_lines))
+            current_file = line
+            current_lines = []
+            line_count = 0
+        elif current_file:
+            line_count += 1
+            if line_count <= MAX_LINES_PER_FILE:
+                current_lines.append(line)
+            elif line_count == MAX_LINES_PER_FILE + 1:
+                current_lines.append("[... truncated]")
+    if current_file:
+        files_patches.append((current_file, current_lines))
+    parts = [f"DIFF STAT:\n{stat}\nTRUNCATED PATCHES:"]
+    for header, lines in files_patches:
+        parts.append(header)
+        parts.extend(lines)
+    return "\n".join(parts)
+
+
 def call_llm(config, diff):
     import requests
+
+    content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
 
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -94,7 +127,7 @@ def call_llm(config, diff):
             "model": config["MODEL"],
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": diff},
+                {"role": "user", "content": content},
             ],
             "temperature": 0,
         },
