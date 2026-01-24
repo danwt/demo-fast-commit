@@ -1,0 +1,147 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "requests",
+# ]
+# ///
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
+
+SYSTEM_PROMPT = """You are a git commit message generator. Given a git diff, analyse the changes and group them into logical atomic commits.
+
+Rules:
+- Each commit should represent one logical change
+- Use conventional commit format: <type>(<scope>): <subject>
+- Types: feat, fix, refactor, chore, docs, style, test, perf
+- Subject: imperative mood, max 50 chars, no period
+- Group files that belong to the same logical change together
+- If all changes are one logical unit, return a single commit
+
+Respond with ONLY a JSON array (no markdown, no explanation):
+[
+  {
+    "files": ["path/to/file1", "path/to/file2"],
+    "message": "feat(auth): add login endpoint"
+  }
+]
+
+If a file is deleted, still include it in the files list - git add handles deletions.
+If a file is renamed, include both old and new paths.
+"""
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"error: config not found at {CONFIG_PATH}", file=sys.stderr)
+        print(f"create it with OPENROUTER_API_KEY and MODEL", file=sys.stderr)
+        sys.exit(1)
+    config = {}
+    for line in CONFIG_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        config[key.strip()] = value.strip()
+    if "OPENROUTER_API_KEY" not in config:
+        print("error: OPENROUTER_API_KEY not set in config", file=sys.stderr)
+        sys.exit(1)
+    if "MODEL" not in config:
+        print("error: MODEL not set in config", file=sys.stderr)
+        sys.exit(1)
+    return config
+
+
+def run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout, result.returncode
+
+
+def get_diff():
+    staged, _ = run(["git", "diff", "--cached", "--name-only"])
+    if staged.strip():
+        diff, _ = run(["git", "diff", "--cached"])
+        return diff, "staged"
+    diff, _ = run(["git", "diff"])
+    if not diff.strip():
+        untracked, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
+        if not untracked.strip():
+            return "", "none"
+        subprocess.run(["git", "add", "-A"], check=True)
+        diff, _ = run(["git", "diff", "--cached"])
+        return diff, "all"
+    subprocess.run(["git", "add", "-A"], check=True)
+    diff, _ = run(["git", "diff", "--cached"])
+    return diff, "all"
+
+
+def call_llm(config, diff):
+    import requests
+
+    resp = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": config["MODEL"],
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": diff},
+            ],
+            "temperature": 0,
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
+        sys.exit(1)
+    content = resp.json()["choices"][0]["message"]["content"]
+    content = content.strip()
+    if content.startswith("```"):
+        content = "\n".join(content.split("\n")[1:])
+    if content.endswith("```"):
+        content = "\n".join(content.split("\n")[:-1])
+    return json.loads(content)
+
+
+def main():
+    config = load_config()
+
+    diff, source = get_diff()
+    if not diff:
+        print("nothing to commit")
+        return
+
+    print(f"analysing {source} changes...")
+    commits = call_llm(config, diff)
+
+    if source == "all":
+        subprocess.run(["git", "reset", "HEAD"], capture_output=True)
+
+    for commit in commits:
+        files = commit["files"]
+        message = commit["message"]
+        subprocess.run(["git", "add", "--"] + files, check=True)
+        result = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"error: commit failed: {result.stderr}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  {message}")
+
+    result = subprocess.run(["git", "push"], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"error: push failed: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    print("pushed")
+
+
+if __name__ == "__main__":
+    main()
