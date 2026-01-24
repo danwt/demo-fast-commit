@@ -48,7 +48,7 @@ def load_config():
         if not line or line.startswith("#"):
             continue
         key, _, value = line.partition("=")
-        config[key.strip()] = value.strip()
+        config[key.strip()] = value.strip().strip("\"'")
     if "OPENROUTER_API_KEY" not in config:
         print("error: OPENROUTER_API_KEY not set in config", file=sys.stderr)
         sys.exit(1)
