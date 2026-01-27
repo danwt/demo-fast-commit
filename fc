@@ -57,26 +57,31 @@ def load_config():
     return config
 
 
-def run(cmd):
+def run(cmd, check=False):
     result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout, result.returncode
+    if check and result.returncode != 0:
+        print(f"error: command failed: {' '.join(cmd)}", file=sys.stderr)
+        if result.stderr:
+            print(f"  {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout, result.stderr, result.returncode
 
 
 def get_diff():
-    staged, _ = run(["git", "diff", "--cached", "--name-only"])
+    staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     if staged.strip():
-        diff, _ = run(["git", "diff", "--cached"])
+        diff, _, _ = run(["git", "diff", "--cached"])
         return diff, "staged"
-    diff, _ = run(["git", "diff"])
+    diff, _, _ = run(["git", "diff"])
     if not diff.strip():
-        untracked, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
+        untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
         if not untracked.strip():
             return "", "none"
-        subprocess.run(["git", "add", "-A"], check=True)
-        diff, _ = run(["git", "diff", "--cached"])
+        run(["git", "add", "-A"], check=True)
+        diff, _, _ = run(["git", "diff", "--cached"])
         return diff, "all"
-    subprocess.run(["git", "add", "-A"], check=True)
-    diff, _ = run(["git", "diff", "--cached"])
+    run(["git", "add", "-A"], check=True)
+    diff, _, _ = run(["git", "diff", "--cached"])
     return diff, "all"
 
 
@@ -85,7 +90,7 @@ MAX_LINES_PER_FILE = 30
 
 
 def compress_diff(diff):
-    stat, _ = run(["git", "diff", "--cached", "--stat"])
+    stat, _, _ = run(["git", "diff", "--cached", "--stat"])
     files_patches = []
     current_file = None
     current_lines = []
@@ -136,13 +141,29 @@ def call_llm(config, diff):
     if resp.status_code != 200:
         print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
         sys.exit(1)
-    content = resp.json()["choices"][0]["message"]["content"]
+    try:
+        resp_json = resp.json()
+    except json.JSONDecodeError as e:
+        print(f"error: failed to parse API response as JSON: {e}", file=sys.stderr)
+        print(f"  response: {resp.text[:500]}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        content = resp_json["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        print(f"error: unexpected API response structure: {e}", file=sys.stderr)
+        print(f"  response: {resp_json}", file=sys.stderr)
+        sys.exit(1)
     content = content.strip()
     if content.startswith("```"):
         content = "\n".join(content.split("\n")[1:])
     if content.endswith("```"):
         content = "\n".join(content.split("\n")[:-1])
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"error: LLM returned invalid JSON: {e}", file=sys.stderr)
+        print(f"  content: {content[:500]}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -157,21 +178,21 @@ def main():
     commits = call_llm(config, diff)
 
     if source == "all":
-        subprocess.run(["git", "reset", "HEAD"], capture_output=True)
+        run(["git", "reset", "HEAD"], check=True)
 
     for commit in commits:
         files = commit["files"]
         message = commit["message"]
-        subprocess.run(["git", "add", "--"] + files, check=True)
-        result = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"error: commit failed: {result.stderr}", file=sys.stderr)
+        run(["git", "add", "--"] + files, check=True)
+        _, stderr, code = run(["git", "commit", "-m", message])
+        if code != 0:
+            print(f"error: commit failed: {stderr}", file=sys.stderr)
             sys.exit(1)
         print(f"  {message}")
 
-    result = subprocess.run(["git", "push"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"error: push failed: {result.stderr}", file=sys.stderr)
+    _, stderr, code = run(["git", "push"])
+    if code != 0:
+        print(f"error: push failed: {stderr}", file=sys.stderr)
         sys.exit(1)
     print("pushed")
 
