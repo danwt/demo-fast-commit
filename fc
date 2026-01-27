@@ -42,6 +42,7 @@ Rules:
 - Use conventional commit format: <type>(<scope>): <subject>
 - Types: feat, fix, refactor, chore, docs, style, test, perf
 - Subject: imperative mood, max 50 chars, no period
+- Description: 1-3 sentences explaining WHY the change was made, not what changed
 - Group files that belong to the same logical change together
 - If all changes are one logical unit, return a single commit
 
@@ -49,7 +50,8 @@ Respond with ONLY a JSON array (no markdown, no explanation):
 [
   {
     "files": ["path/to/file1", "path/to/file2"],
-    "message": "feat(auth): add login endpoint"
+    "message": "feat(auth): add login endpoint",
+    "description": "Users need to authenticate before accessing protected resources. This adds the initial login flow with session management."
   }
 ]
 
@@ -80,10 +82,12 @@ Rules:
 - Use conventional commit format: <type>(<scope>): <subject>
 - Types: feat, fix, refactor, chore, docs, style, test, perf
 - Subject: imperative mood, max 50 chars, no period
+- Description: 1-3 sentences explaining WHY the change was made, not what changed
 
 Respond with ONLY a JSON object (no markdown, no explanation):
 {
-  "message": "feat(auth): add login endpoint"
+  "message": "feat(auth): add login endpoint",
+  "description": "Users need to authenticate before accessing protected resources. This adds the initial login flow with session management."
 }
 """
 
@@ -253,14 +257,19 @@ def validate_and_fix_commits(commits, staged_files):
             continue
 
         covered_files.update(normalized)
-        fixed_commits.append({"files": normalized, "message": commit["message"]})
+        fixed_commits.append({
+            "files": normalized,
+            "message": commit["message"],
+            "description": commit.get("description", ""),
+        })
 
     missing_files = all_staged - covered_files
     if missing_files:
         print(f"  {len(missing_files)} files not grouped by LLM, adding to catch-all commit")
         fixed_commits.append({
             "files": list(missing_files),
-            "message": "chore: update remaining files"
+            "message": "chore: update remaining files",
+            "description": "",
         })
 
     return fixed_commits
@@ -557,10 +566,12 @@ def call_llm_two_phase(config, staged_files):
         # Handle various response formats
         if isinstance(result, dict):
             message = result.get("message", "chore: update files")
+            description = result.get("description", "")
         else:
             message = "chore: update files"
+            description = ""
 
-        commits.append({"files": normalized, "message": message})
+        commits.append({"files": normalized, "message": message, "description": description})
 
     return commits
 
@@ -621,6 +632,8 @@ def main():
         print("\ndry run - would create these commits:")
         for commit in commits:
             print(f"  {commit['message']}")
+            if commit.get("description"):
+                print(f"    {commit['description']}")
             for f in commit["files"]:
                 print(f"    - {f}")
         if lockfiles:
@@ -639,6 +652,7 @@ def main():
     for commit in commits:
         files = commit["files"]
         message = commit["message"]
+        description = commit.get("description", "")
 
         # Add files one by one to handle missing files gracefully
         added_files = []
@@ -653,7 +667,11 @@ def main():
             print(f"  skipping commit (no files staged): {message}")
             continue
 
-        _, stderr, code = run(commit_args + ["-m", message])
+        # Use two -m flags: first for subject, second for body
+        commit_cmd = commit_args + ["-m", message]
+        if description:
+            commit_cmd += ["-m", description]
+        _, stderr, code = run(commit_cmd)
         if code != 0:
             print(f"error: commit failed: {stderr}", file=sys.stderr)
             sys.exit(1)
