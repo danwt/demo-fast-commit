@@ -16,10 +16,11 @@ Use this skill when the user wants to quickly commit and push their current git 
 
 ## How to invoke
 
-Run the `fastc` command from the current working directory:
-
 ```bash
-fastc
+fastc                # analyse, commit, and push
+fastc --dry-run      # preview commits without executing
+fastc --no-push      # commit but don't push
+fastc --no-verify    # bypass pre-commit hooks
 ```
 
 ## Prerequisites
@@ -31,12 +32,15 @@ fastc
 ## What it does
 
 1. Detects staged or unstaged changes
-2. Sends the diff to an LLM via OpenRouter
-3. Creates one or more atomic commits with conventional commit messages
-4. Pushes to the remote
+2. Excludes lockfiles from analysis (commits them separately)
+3. For large diffs (15+ files), uses two-phase grouping approach
+4. Sends diff to LLM via OpenRouter
+5. Creates atomic commits with conventional commit messages
+6. Pushes to the remote
 
 ## Troubleshooting
 
 - If it says "nothing to commit", there are no changes in the repo
-- If the API returns 401, the OpenRouter key is invalid or has quotes around it in the config
-- The config file is at `~/.config/fast-commit/.env`
+- If the API returns 401, the OpenRouter key is invalid or has quotes around it
+- If pre-commit hooks block the commit, use `--no-verify` to bypass
+- Config file: `~/.config/fast-commit/.env`
