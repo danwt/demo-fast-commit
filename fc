@@ -246,20 +246,26 @@ def call_llm_raw(config, system_prompt, user_content):
     """Make a raw LLM API call and return parsed JSON."""
     import requests
 
+    use_structured = config.get("STRUCTURED_OUTPUT", "true").lower() == "true"
+
+    request_body = {
+        "model": config["MODEL"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0,
+    }
+    if use_structured:
+        request_body["response_format"] = {"type": "json_object"}
+
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": config["MODEL"],
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0,
-        },
+        json=request_body,
         timeout=60,
     )
     if resp.status_code != 200:
