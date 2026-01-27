@@ -67,22 +67,36 @@ def run(cmd, check=False):
     return result.stdout, result.stderr, result.returncode
 
 
+def strip_diff_noise(diff):
+    """Remove noise lines from diff to save tokens."""
+    lines = []
+    for line in diff.splitlines():
+        if line.startswith("index "):
+            continue
+        if line.startswith("similarity index "):
+            continue
+        if line.startswith("dissimilarity index "):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def get_diff():
     staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     if staged.strip():
-        diff, _, _ = run(["git", "diff", "--cached"])
-        return diff, "staged"
-    diff, _, _ = run(["git", "diff"])
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+        return strip_diff_noise(diff), "staged"
+    diff, _, _ = run(["git", "diff", "--minimal"])
     if not diff.strip():
         untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
         if not untracked.strip():
             return "", "none"
         run(["git", "add", "-A"], check=True)
-        diff, _, _ = run(["git", "diff", "--cached"])
-        return diff, "all"
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+        return strip_diff_noise(diff), "all"
     run(["git", "add", "-A"], check=True)
-    diff, _, _ = run(["git", "diff", "--cached"])
-    return diff, "all"
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+    return strip_diff_noise(diff), "all"
 
 
 MAX_DIFF_CHARS = 20000
