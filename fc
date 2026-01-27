@@ -89,13 +89,15 @@ def load_config():
 
 
 def run(cmd, check=False):
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True)
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if check and result.returncode != 0:
         print(f"error: command failed: {' '.join(cmd)}", file=sys.stderr)
-        if result.stderr:
-            print(f"  {result.stderr.strip()}", file=sys.stderr)
+        if stderr:
+            print(f"  {stderr.strip()}", file=sys.stderr)
         sys.exit(1)
-    return result.stdout, result.stderr, result.returncode
+    return stdout, stderr, result.returncode
 
 
 def strip_diff_noise(diff):
