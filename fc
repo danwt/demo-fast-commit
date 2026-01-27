@@ -89,6 +89,42 @@ MAX_DIFF_CHARS = 20000
 MAX_LINES_PER_FILE = 30
 
 
+def parse_files_from_diff(diff):
+    """Extract the set of files mentioned in a diff."""
+    files = set()
+    for line in diff.splitlines():
+        if line.startswith("diff --git a/"):
+            parts = line.split(" b/")
+            if len(parts) == 2:
+                files.add(parts[1])
+        elif line.startswith("rename from "):
+            files.add(line[12:])
+        elif line.startswith("rename to "):
+            files.add(line[10:])
+    return files
+
+
+def validate_commits(commits, diff_files):
+    """Validate LLM output against actual diff files."""
+    llm_files = set()
+    for commit in commits:
+        if "files" not in commit or "message" not in commit:
+            print("error: LLM returned commit without 'files' or 'message' field", file=sys.stderr)
+            print(f"  commit: {commit}", file=sys.stderr)
+            sys.exit(1)
+        for f in commit["files"]:
+            llm_files.add(f)
+
+    unknown_files = llm_files - diff_files
+    if unknown_files:
+        print(f"error: LLM returned files not in diff: {unknown_files}", file=sys.stderr)
+        sys.exit(1)
+
+    missing_files = diff_files - llm_files
+    if missing_files:
+        print(f"warning: files in diff not covered by LLM: {missing_files}", file=sys.stderr)
+
+
 def compress_diff(diff):
     stat, _, _ = run(["git", "diff", "--cached", "--stat"])
     files_patches = []
@@ -176,6 +212,9 @@ def main():
 
     print(f"analysing {source} changes...")
     commits = call_llm(config, diff)
+
+    diff_files = parse_files_from_diff(diff)
+    validate_commits(commits, diff_files)
 
     if source == "all":
         run(["git", "reset", "HEAD"], check=True)
