@@ -6,6 +6,7 @@
 # ]
 # ///
 
+import argparse
 import json
 import subprocess
 import sys
@@ -13,6 +14,26 @@ import time
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
+
+# Files to exclude from diff analysis (don't help with commit messages)
+EXCLUDED_PATTERNS = [
+    # JS/Node lockfiles
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "bun.lockb",
+    # Other language lockfiles
+    "Cargo.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "go.sum",
+    "composer.lock",
+    "Gemfile.lock",
+    # Minified/generated files
+    "*.min.js",
+    "*.min.css",
+    "*.map",
+]
 
 SYSTEM_PROMPT = """You are a git commit message generator. Given a git diff, analyse the changes and group them into logical atomic commits.
 
@@ -100,6 +121,14 @@ def run(cmd, check=False):
     return stdout, stderr, result.returncode
 
 
+def build_pathspec_excludes():
+    """Build git pathspec exclude args for lockfiles etc."""
+    excludes = []
+    for pattern in EXCLUDED_PATTERNS:
+        excludes.extend([":(exclude)" + pattern])
+    return excludes
+
+
 def strip_diff_noise(diff):
     """Remove noise lines from diff to save tokens."""
     lines = []
@@ -115,9 +144,11 @@ def strip_diff_noise(diff):
 
 
 def get_diff():
+    """Get diff for analysis, excluding lockfiles from LLM context."""
+    excludes = build_pathspec_excludes()
     staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     if staged.strip():
-        diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
         return strip_diff_noise(diff), "staged"
     diff, _, _ = run(["git", "diff", "--minimal"])
     if not diff.strip():
@@ -125,10 +156,10 @@ def get_diff():
         if not untracked.strip():
             return "", "none"
         run(["git", "add", "-A"], check=True)
-        diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
         return strip_diff_noise(diff), "all"
     run(["git", "add", "-A"], check=True)
-    diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
     return strip_diff_noise(diff), "all"
 
 
@@ -136,6 +167,7 @@ MAX_DIFF_CHARS = 20000
 MAX_LINES_PER_HUNK = 15
 MAX_HUNKS_PER_FILE = 5
 LARGE_DIFF_FILES = 15
+MAX_OUTPUT_TOKENS = 4096
 
 
 def parse_files_from_diff(diff):
@@ -153,25 +185,85 @@ def parse_files_from_diff(diff):
     return files
 
 
-def validate_commits(commits, diff_files):
-    """Validate LLM output against actual diff files."""
-    llm_files = set()
+def get_staged_files_for_commit():
+    """Get actual staged files that can be committed.
+
+    Returns dict mapping new_path -> old_path (same if not renamed).
+    This ensures we use paths that actually exist for git add.
+    """
+    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M"])
+    files = {}
+    for line in name_status.strip().splitlines():
+        if not line:
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status.startswith("R"):  # Rename: R100\told\tnew
+            old_path = parts[1]
+            new_path = parts[2]
+            files[new_path] = old_path
+        elif status == "D":  # Deleted
+            files[parts[1]] = parts[1]
+        else:  # Added, Modified, etc
+            files[parts[1]] = parts[1]
+    return files
+
+
+def normalize_llm_files(llm_files, staged_files):
+    """Map LLM file paths to actual staged paths.
+
+    The LLM might return old paths for renamed files or paths that don't exist.
+    This maps them to actual paths that git can work with.
+    """
+    # Build reverse lookup: old_path -> new_path
+    old_to_new = {old: new for new, old in staged_files.items()}
+
+    normalized = []
+    for f in llm_files:
+        if f in staged_files:
+            # File exists as-is (new path or unchanged)
+            normalized.append(f)
+        elif f in old_to_new:
+            # LLM returned old path of renamed file, use new path
+            normalized.append(old_to_new[f])
+        # Skip files that don't exist at all (hallucinated or already committed)
+    return normalized
+
+
+def validate_and_fix_commits(commits, staged_files):
+    """Validate LLM output and fix issues.
+
+    - Normalizes file paths (handles renames)
+    - Removes invalid files
+    - Adds missing files to a catch-all commit
+    - Returns fixed list of commits
+    """
+    all_staged = set(staged_files.keys())
+    covered_files = set()
+    fixed_commits = []
+
     for commit in commits:
         if "files" not in commit or "message" not in commit:
-            print("error: LLM returned commit without 'files' or 'message' field", file=sys.stderr)
-            print(f"  commit: {commit}", file=sys.stderr)
-            sys.exit(1)
-        for f in commit["files"]:
-            llm_files.add(f)
+            print(f"  warning: skipping malformed commit: {commit}", file=sys.stderr)
+            continue
 
-    unknown_files = llm_files - diff_files
-    if unknown_files:
-        print(f"error: LLM returned files not in diff: {unknown_files}", file=sys.stderr)
-        sys.exit(1)
+        normalized = normalize_llm_files(commit["files"], staged_files)
+        if not normalized:
+            print(f"  warning: skipping commit with no valid files: {commit['message']}", file=sys.stderr)
+            continue
 
-    missing_files = diff_files - llm_files
+        covered_files.update(normalized)
+        fixed_commits.append({"files": normalized, "message": commit["message"]})
+
+    missing_files = all_staged - covered_files
     if missing_files:
-        print(f"warning: files in diff not covered by LLM: {missing_files}", file=sys.stderr)
+        print(f"  {len(missing_files)} files not grouped by LLM, adding to catch-all commit")
+        fixed_commits.append({
+            "files": list(missing_files),
+            "message": "chore: update remaining files"
+        })
+
+    return fixed_commits
 
 
 def get_diff_for_files(files):
@@ -189,8 +281,9 @@ def compress_diff(diff):
     - Limit lines per hunk, prioritizing additions (+) over context
     - Limit total hunks per file
     """
-    stat, _, _ = run(["git", "diff", "--cached", "--stat"])
-    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat"])
+    excludes = build_pathspec_excludes()
+    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
+    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat", "--"] + excludes)
 
     parts = [f"DIFF STAT:\n{stat}"]
     if dirstat.strip():
@@ -249,6 +342,59 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 
 
+def try_repair_json(content):
+    """Attempt to repair truncated JSON arrays/objects.
+
+    Common truncation patterns:
+    - Array cut mid-string: [..., "file  -> close string and array
+    - Array cut mid-object: [..., {"files": ["a"]  -> close object and array
+    """
+    content = content.rstrip()
+
+    # Try as-is first
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    # Try adding closing brackets/braces
+    repairs = [
+        '"}]',      # truncated mid-string in array
+        '"]}}]',    # truncated mid-array in object in array
+        '"}]}]',    # truncated mid-string in nested structure
+        '"]',       # truncated mid-array
+        '"}',       # truncated mid-string in object
+        '}]',       # truncated mid-object in array
+        ']',        # truncated array
+        '}',        # truncated object
+    ]
+
+    for repair in repairs:
+        try:
+            result = json.loads(content + repair)
+            print(f"  repaired truncated JSON with: {repair}")
+            return result
+        except json.JSONDecodeError:
+            continue
+
+    # Try removing the last incomplete element
+    # Find the last complete element (ends with }, or ])
+    for end_char in ['},', '],', '}', ']']:
+        idx = content.rfind(end_char)
+        if idx > 0:
+            truncated = content[:idx + len(end_char)]
+            # Add closing brackets as needed
+            for close in [']', ']}', '}]', ']}]']:
+                try:
+                    result = json.loads(truncated + close)
+                    print(f"  repaired truncated JSON by removing incomplete element")
+                    return result
+                except json.JSONDecodeError:
+                    continue
+
+    return None
+
+
 def call_llm_raw(config, system_prompt, user_content):
     """Make a raw LLM API call and return parsed JSON."""
     import requests
@@ -262,6 +408,7 @@ def call_llm_raw(config, system_prompt, user_content):
             {"role": "user", "content": user_content},
         ],
         "temperature": 0,
+        "max_tokens": MAX_OUTPUT_TOKENS,
     }
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
@@ -327,12 +474,35 @@ def call_llm_raw(config, system_prompt, user_content):
         content = "\n".join(content.split("\n")[1:])
     if content.endswith("```"):
         content = "\n".join(content.split("\n")[:-1])
+    content = content.strip()
+
+    # Check if response was truncated (finish_reason)
+    finish_reason = resp_json.get("choices", [{}])[0].get("finish_reason", "")
+    if finish_reason == "length":
+        print("  warning: LLM response was truncated due to length limit")
+
+    # Try normal parse first
     try:
         return json.loads(content)
-    except json.JSONDecodeError as e:
-        print(f"error: LLM returned invalid JSON: {e}", file=sys.stderr)
-        print(f"  content: {content[:500]}", file=sys.stderr)
-        sys.exit(1)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to repair truncated JSON
+    repaired = try_repair_json(content)
+    if repaired is not None:
+        return repaired
+
+    # Last resort: return empty list for arrays, empty dict for objects
+    if content.lstrip().startswith("["):
+        print("  warning: could not parse JSON array, returning empty list")
+        return []
+    elif content.lstrip().startswith("{"):
+        print("  warning: could not parse JSON object, returning empty dict")
+        return {}
+
+    print(f"error: LLM returned unparseable response", file=sys.stderr)
+    print(f"  content: {content[:500]}", file=sys.stderr)
+    sys.exit(1)
 
 
 def call_llm(config, diff):
@@ -341,36 +511,83 @@ def call_llm(config, diff):
     return call_llm_raw(config, SYSTEM_PROMPT, content)
 
 
-def call_llm_two_phase(config, diff_files):
+def call_llm_two_phase(config, staged_files):
     """Two-phase approach for large diffs with many files.
 
     Phase 1: Send file summary (name-status + stat) to get logical groupings
     Phase 2: For each group, send actual diff to generate commit message
     """
-    name_status, _, _ = run(["git", "diff", "--cached", "--name-status"])
-    stat, _, _ = run(["git", "diff", "--cached", "--stat"])
+    excludes = build_pathspec_excludes()
+    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--"] + excludes)
+    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
 
     phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
     print("  phase 1: grouping files...")
+
     groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
+
+    # Handle case where LLM returns a dict with "groups" key instead of array
+    if isinstance(groups, dict):
+        groups = groups.get("groups", groups.get("commits", []))
+
+    if not isinstance(groups, list):
+        print("  warning: LLM returned non-list, treating all files as one group")
+        groups = [{"files": list(staged_files.keys()), "hint": "all changes"}]
 
     commits = []
     for i, group in enumerate(groups):
+        if not isinstance(group, dict):
+            continue
         files = group.get("files", [])
         if not files:
             continue
+
+        # Normalize files to actual staged paths
+        normalized = normalize_llm_files(files, staged_files)
+        if not normalized:
+            continue
+
         print(f"  phase 2: generating message for group {i + 1}/{len(groups)}...")
-        group_diff = get_diff_for_files(files)
+        group_diff = get_diff_for_files(normalized)
         if not group_diff.strip():
             continue
         content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
         result = call_llm_raw(config, PHASE2_PROMPT, content)
-        commits.append({"files": files, "message": result.get("message", "chore: update files")})
+
+        # Handle various response formats
+        if isinstance(result, dict):
+            message = result.get("message", "chore: update files")
+        else:
+            message = "chore: update files"
+
+        commits.append({"files": normalized, "message": message})
 
     return commits
 
 
+def get_lockfiles_in_staging():
+    """Get list of lockfiles that are staged."""
+    staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
+    lockfiles = []
+    for f in staged.strip().splitlines():
+        for pattern in EXCLUDED_PATTERNS:
+            if pattern.startswith("*"):
+                if f.endswith(pattern[1:]):
+                    lockfiles.append(f)
+                    break
+            elif f.endswith(pattern) or f == pattern:
+                lockfiles.append(f)
+                break
+    return lockfiles
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Fast commit with LLM-generated messages")
+    parser.add_argument("--no-verify", action="store_true", help="bypass pre-commit hooks")
+    parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
+    parser.add_argument("--no-push", action="store_true", help="skip automatic push")
+    args = parser.parse_args()
+
     config = load_config()
 
     diff, source = get_diff()
@@ -378,29 +595,82 @@ def main():
         print("nothing to commit")
         return
 
-    diff_files = parse_files_from_diff(diff)
-    file_count = len(diff_files)
+    staged_files = get_staged_files_for_commit()
+    file_count = len(staged_files)
+
+    if file_count == 0:
+        print("nothing to commit")
+        return
+
+    # Check for lockfiles before we reset staging (must happen before reset)
+    lockfiles = get_lockfiles_in_staging() if source == "all" else []
 
     print(f"analysing {source} changes ({file_count} files)...")
     if file_count > LARGE_DIFF_FILES:
-        print(f"  using two-phase approach for large diff")
-        commits = call_llm_two_phase(config, diff_files)
+        print("  using two-phase approach for large diff")
+        commits = call_llm_two_phase(config, staged_files)
     else:
         commits = call_llm(config, diff)
-    validate_commits(commits, diff_files)
+    commits = validate_and_fix_commits(commits, staged_files)
+
+    if not commits:
+        print("error: no valid commits generated", file=sys.stderr)
+        sys.exit(1)
+
+    if args.dry_run:
+        print("\ndry run - would create these commits:")
+        for commit in commits:
+            print(f"  {commit['message']}")
+            for f in commit["files"]:
+                print(f"    - {f}")
+        if lockfiles:
+            print(f"  chore: update lockfiles")
+            for f in lockfiles:
+                print(f"    - {f}")
+        return
 
     if source == "all":
         run(["git", "reset", "HEAD"], check=True)
 
+    commit_args = ["git", "commit"]
+    if args.no_verify:
+        commit_args.append("--no-verify")
+
     for commit in commits:
         files = commit["files"]
         message = commit["message"]
-        run(["git", "add", "--"] + files, check=True)
-        _, stderr, code = run(["git", "commit", "-m", message])
+
+        # Add files one by one to handle missing files gracefully
+        added_files = []
+        for f in files:
+            _, stderr, code = run(["git", "add", "--", f])
+            if code == 0:
+                added_files.append(f)
+            else:
+                print(f"  warning: could not stage {f}: {stderr.strip()}", file=sys.stderr)
+
+        if not added_files:
+            print(f"  skipping commit (no files staged): {message}")
+            continue
+
+        _, stderr, code = run(commit_args + ["-m", message])
         if code != 0:
             print(f"error: commit failed: {stderr}", file=sys.stderr)
             sys.exit(1)
         print(f"  {message}")
+
+    # Commit lockfiles separately with a simple message
+    if lockfiles:
+        run(["git", "add", "--"] + lockfiles, check=True)
+        _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
+        if code != 0:
+            print(f"error: lockfile commit failed: {stderr}", file=sys.stderr)
+            sys.exit(1)
+        print("  chore: update lockfiles")
+
+    if args.no_push:
+        print("done (push skipped)")
+        return
 
     _, stderr, code = run(["git", "push"])
     if code != 0:
