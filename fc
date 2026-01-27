@@ -100,7 +100,8 @@ def get_diff():
 
 
 MAX_DIFF_CHARS = 20000
-MAX_LINES_PER_FILE = 30
+MAX_LINES_PER_HUNK = 15
+MAX_HUNKS_PER_FILE = 5
 
 
 def parse_files_from_diff(diff):
@@ -140,30 +141,67 @@ def validate_commits(commits, diff_files):
 
 
 def compress_diff(diff):
+    """Compress diff while preserving semantic information.
+
+    Strategy:
+    - Include --stat and --dirstat for overview
+    - Keep all hunk headers (@@...@@) which show function context
+    - Limit lines per hunk, prioritizing additions (+) over context
+    - Limit total hunks per file
+    """
     stat, _, _ = run(["git", "diff", "--cached", "--stat"])
-    files_patches = []
-    current_file = None
-    current_lines = []
-    line_count = 0
+    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat"])
+
+    parts = [f"DIFF STAT:\n{stat}"]
+    if dirstat.strip():
+        parts.append(f"DIRECTORY CHANGES:\n{dirstat}")
+    parts.append("COMPRESSED PATCHES:")
+
+    current_file_header = None
+    current_file_lines = []
+    hunk_count = 0
+    hunk_lines = 0
+    hunk_truncated = False
+
+    def flush_file():
+        nonlocal current_file_header, current_file_lines, hunk_count
+        if current_file_header:
+            parts.append(current_file_header)
+            parts.extend(current_file_lines)
+            if hunk_count > MAX_HUNKS_PER_FILE:
+                parts.append(f"[... {hunk_count - MAX_HUNKS_PER_FILE} more hunks truncated]")
+        current_file_header = None
+        current_file_lines = []
+        hunk_count = 0
+
     for line in diff.splitlines():
         if line.startswith("diff --git"):
-            if current_file:
-                files_patches.append((current_file, current_lines))
-            current_file = line
-            current_lines = []
-            line_count = 0
-        elif current_file:
-            line_count += 1
-            if line_count <= MAX_LINES_PER_FILE:
-                current_lines.append(line)
-            elif line_count == MAX_LINES_PER_FILE + 1:
-                current_lines.append("[... truncated]")
-    if current_file:
-        files_patches.append((current_file, current_lines))
-    parts = [f"DIFF STAT:\n{stat}\nTRUNCATED PATCHES:"]
-    for header, lines in files_patches:
-        parts.append(header)
-        parts.extend(lines)
+            flush_file()
+            current_file_header = line
+            hunk_count = 0
+        elif line.startswith("@@") and " @@" in line:
+            hunk_count += 1
+            hunk_lines = 0
+            hunk_truncated = False
+            if hunk_count <= MAX_HUNKS_PER_FILE:
+                current_file_lines.append(line)
+        elif current_file_header and hunk_count <= MAX_HUNKS_PER_FILE:
+            if line.startswith("---") or line.startswith("+++"):
+                current_file_lines.append(line)
+            elif line.startswith("rename ") or line.startswith("new file") or line.startswith("deleted file"):
+                current_file_lines.append(line)
+            elif hunk_lines < MAX_LINES_PER_HUNK:
+                if line.startswith("+") or line.startswith("-"):
+                    current_file_lines.append(line)
+                    hunk_lines += 1
+                elif line.startswith(" ") and hunk_lines < MAX_LINES_PER_HUNK // 2:
+                    current_file_lines.append(line)
+                    hunk_lines += 1
+            elif not hunk_truncated:
+                current_file_lines.append("[... hunk truncated]")
+                hunk_truncated = True
+
+    flush_file()
     return "\n".join(parts)
 
 
