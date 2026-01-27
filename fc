@@ -35,6 +35,36 @@ If a file is deleted, still include it in the files list - git add handles delet
 If a file is renamed, include both old and new paths.
 """
 
+PHASE1_PROMPT = """You are a git commit analyzer. Given a summary of changed files (name-status and stats), group them into logical atomic commits.
+
+Rules:
+- Each group should represent one logical change
+- Group files that belong to the same logical change together
+- If all changes are one logical unit, return a single group
+- Use the file paths and change types (A=added, M=modified, D=deleted, R=renamed) to understand the changes
+
+Respond with ONLY a JSON array of file groups (no markdown, no explanation):
+[
+  {
+    "files": ["path/to/file1", "path/to/file2"],
+    "hint": "brief description of what these files do together"
+  }
+]
+"""
+
+PHASE2_PROMPT = """You are a git commit message generator. Given a diff for a specific group of related files, generate ONE commit message.
+
+Rules:
+- Use conventional commit format: <type>(<scope>): <subject>
+- Types: feat, fix, refactor, chore, docs, style, test, perf
+- Subject: imperative mood, max 50 chars, no period
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "message": "feat(auth): add login endpoint"
+}
+"""
+
 
 def load_config():
     if not CONFIG_PATH.exists():
@@ -102,6 +132,7 @@ def get_diff():
 MAX_DIFF_CHARS = 20000
 MAX_LINES_PER_HUNK = 15
 MAX_HUNKS_PER_FILE = 5
+LARGE_DIFF_FILES = 15
 
 
 def parse_files_from_diff(diff):
@@ -138,6 +169,12 @@ def validate_commits(commits, diff_files):
     missing_files = diff_files - llm_files
     if missing_files:
         print(f"warning: files in diff not covered by LLM: {missing_files}", file=sys.stderr)
+
+
+def get_diff_for_files(files):
+    """Get the diff for specific files only."""
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + list(files))
+    return strip_diff_noise(diff)
 
 
 def compress_diff(diff):
@@ -205,10 +242,9 @@ def compress_diff(diff):
     return "\n".join(parts)
 
 
-def call_llm(config, diff):
+def call_llm_raw(config, system_prompt, user_content):
+    """Make a raw LLM API call and return parsed JSON."""
     import requests
-
-    content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
 
     resp = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
@@ -219,8 +255,8 @@ def call_llm(config, diff):
         json={
             "model": config["MODEL"],
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0,
         },
@@ -254,6 +290,41 @@ def call_llm(config, diff):
         sys.exit(1)
 
 
+def call_llm(config, diff):
+    """Single-phase: send diff and get commits."""
+    content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
+    return call_llm_raw(config, SYSTEM_PROMPT, content)
+
+
+def call_llm_two_phase(config, diff_files):
+    """Two-phase approach for large diffs with many files.
+
+    Phase 1: Send file summary (name-status + stat) to get logical groupings
+    Phase 2: For each group, send actual diff to generate commit message
+    """
+    name_status, _, _ = run(["git", "diff", "--cached", "--name-status"])
+    stat, _, _ = run(["git", "diff", "--cached", "--stat"])
+
+    phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
+    print("  phase 1: grouping files...")
+    groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
+
+    commits = []
+    for i, group in enumerate(groups):
+        files = group.get("files", [])
+        if not files:
+            continue
+        print(f"  phase 2: generating message for group {i + 1}/{len(groups)}...")
+        group_diff = get_diff_for_files(files)
+        if not group_diff.strip():
+            continue
+        content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
+        result = call_llm_raw(config, PHASE2_PROMPT, content)
+        commits.append({"files": files, "message": result.get("message", "chore: update files")})
+
+    return commits
+
+
 def main():
     config = load_config()
 
@@ -262,10 +333,15 @@ def main():
         print("nothing to commit")
         return
 
-    print(f"analysing {source} changes...")
-    commits = call_llm(config, diff)
-
     diff_files = parse_files_from_diff(diff)
+    file_count = len(diff_files)
+
+    print(f"analysing {source} changes ({file_count} files)...")
+    if file_count > LARGE_DIFF_FILES:
+        print(f"  using two-phase approach for large diff")
+        commits = call_llm_two_phase(config, diff_files)
+    else:
+        commits = call_llm(config, diff)
     validate_commits(commits, diff_files)
 
     if source == "all":
