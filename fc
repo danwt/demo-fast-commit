@@ -9,6 +9,7 @@
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
@@ -242,6 +243,10 @@ def compress_diff(diff):
     return "\n".join(parts)
 
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_RETRIES = 3
+
+
 def call_llm_raw(config, system_prompt, user_content):
     """Make a raw LLM API call and return parsed JSON."""
     import requests
@@ -259,17 +264,49 @@ def call_llm_raw(config, system_prompt, user_content):
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
 
-    resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
-            "Content-Type": "application/json",
-        },
-        json=request_body,
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
+                    "Content-Type": "application/json",
+                },
+                json=request_body,
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                break
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                last_error = f"API returned {resp.status_code}: {resp.text[:200]}"
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = 2**attempt
+                    print(f"  retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                    time.sleep(wait_time)
+                    continue
+            print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        except requests.exceptions.Timeout:
+            last_error = "request timed out"
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2**attempt
+                print(f"  request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                time.sleep(wait_time)
+                continue
+            print(f"error: LLM API request timed out after {MAX_RETRIES} attempts", file=sys.stderr)
+            sys.exit(1)
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2**attempt
+                print(f"  request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                time.sleep(wait_time)
+                continue
+            print(f"error: LLM API request failed after {MAX_RETRIES} attempts: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"error: LLM API failed after {MAX_RETRIES} attempts: {last_error}", file=sys.stderr)
         sys.exit(1)
     try:
         resp_json = resp.json()
