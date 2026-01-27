@@ -9,6 +9,7 @@
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
@@ -35,6 +36,36 @@ If a file is deleted, still include it in the files list - git add handles delet
 If a file is renamed, include both old and new paths.
 """
 
+PHASE1_PROMPT = """You are a git commit analyzer. Given a summary of changed files (name-status and stats), group them into logical atomic commits.
+
+Rules:
+- Each group should represent one logical change
+- Group files that belong to the same logical change together
+- If all changes are one logical unit, return a single group
+- Use the file paths and change types (A=added, M=modified, D=deleted, R=renamed) to understand the changes
+
+Respond with ONLY a JSON array of file groups (no markdown, no explanation):
+[
+  {
+    "files": ["path/to/file1", "path/to/file2"],
+    "hint": "brief description of what these files do together"
+  }
+]
+"""
+
+PHASE2_PROMPT = """You are a git commit message generator. Given a diff for a specific group of related files, generate ONE commit message.
+
+Rules:
+- Use conventional commit format: <type>(<scope>): <subject>
+- Types: feat, fix, refactor, chore, docs, style, test, perf
+- Subject: imperative mood, max 50 chars, no period
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{
+  "message": "feat(auth): add login endpoint"
+}
+"""
+
 
 def load_config():
     if not CONFIG_PATH.exists():
@@ -57,92 +88,284 @@ def load_config():
     return config
 
 
-def run(cmd):
+def run(cmd, check=False):
     result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout, result.returncode
+    if check and result.returncode != 0:
+        print(f"error: command failed: {' '.join(cmd)}", file=sys.stderr)
+        if result.stderr:
+            print(f"  {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout, result.stderr, result.returncode
+
+
+def strip_diff_noise(diff):
+    """Remove noise lines from diff to save tokens."""
+    lines = []
+    for line in diff.splitlines():
+        if line.startswith("index "):
+            continue
+        if line.startswith("similarity index "):
+            continue
+        if line.startswith("dissimilarity index "):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def get_diff():
-    staged, _ = run(["git", "diff", "--cached", "--name-only"])
+    staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     if staged.strip():
-        diff, _ = run(["git", "diff", "--cached"])
-        return diff, "staged"
-    diff, _ = run(["git", "diff"])
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+        return strip_diff_noise(diff), "staged"
+    diff, _, _ = run(["git", "diff", "--minimal"])
     if not diff.strip():
-        untracked, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
+        untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
         if not untracked.strip():
             return "", "none"
-        subprocess.run(["git", "add", "-A"], check=True)
-        diff, _ = run(["git", "diff", "--cached"])
-        return diff, "all"
-    subprocess.run(["git", "add", "-A"], check=True)
-    diff, _ = run(["git", "diff", "--cached"])
-    return diff, "all"
+        run(["git", "add", "-A"], check=True)
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+        return strip_diff_noise(diff), "all"
+    run(["git", "add", "-A"], check=True)
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal"])
+    return strip_diff_noise(diff), "all"
 
 
 MAX_DIFF_CHARS = 20000
-MAX_LINES_PER_FILE = 30
+MAX_LINES_PER_HUNK = 15
+MAX_HUNKS_PER_FILE = 5
+LARGE_DIFF_FILES = 15
+
+
+def parse_files_from_diff(diff):
+    """Extract the set of files mentioned in a diff."""
+    files = set()
+    for line in diff.splitlines():
+        if line.startswith("diff --git a/"):
+            parts = line.split(" b/")
+            if len(parts) == 2:
+                files.add(parts[1])
+        elif line.startswith("rename from "):
+            files.add(line[12:])
+        elif line.startswith("rename to "):
+            files.add(line[10:])
+    return files
+
+
+def validate_commits(commits, diff_files):
+    """Validate LLM output against actual diff files."""
+    llm_files = set()
+    for commit in commits:
+        if "files" not in commit or "message" not in commit:
+            print("error: LLM returned commit without 'files' or 'message' field", file=sys.stderr)
+            print(f"  commit: {commit}", file=sys.stderr)
+            sys.exit(1)
+        for f in commit["files"]:
+            llm_files.add(f)
+
+    unknown_files = llm_files - diff_files
+    if unknown_files:
+        print(f"error: LLM returned files not in diff: {unknown_files}", file=sys.stderr)
+        sys.exit(1)
+
+    missing_files = diff_files - llm_files
+    if missing_files:
+        print(f"warning: files in diff not covered by LLM: {missing_files}", file=sys.stderr)
+
+
+def get_diff_for_files(files):
+    """Get the diff for specific files only."""
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + list(files))
+    return strip_diff_noise(diff)
 
 
 def compress_diff(diff):
-    stat, _ = run(["git", "diff", "--cached", "--stat"])
-    files_patches = []
-    current_file = None
-    current_lines = []
-    line_count = 0
+    """Compress diff while preserving semantic information.
+
+    Strategy:
+    - Include --stat and --dirstat for overview
+    - Keep all hunk headers (@@...@@) which show function context
+    - Limit lines per hunk, prioritizing additions (+) over context
+    - Limit total hunks per file
+    """
+    stat, _, _ = run(["git", "diff", "--cached", "--stat"])
+    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat"])
+
+    parts = [f"DIFF STAT:\n{stat}"]
+    if dirstat.strip():
+        parts.append(f"DIRECTORY CHANGES:\n{dirstat}")
+    parts.append("COMPRESSED PATCHES:")
+
+    current_file_header = None
+    current_file_lines = []
+    hunk_count = 0
+    hunk_lines = 0
+    hunk_truncated = False
+
+    def flush_file():
+        nonlocal current_file_header, current_file_lines, hunk_count
+        if current_file_header:
+            parts.append(current_file_header)
+            parts.extend(current_file_lines)
+            if hunk_count > MAX_HUNKS_PER_FILE:
+                parts.append(f"[... {hunk_count - MAX_HUNKS_PER_FILE} more hunks truncated]")
+        current_file_header = None
+        current_file_lines = []
+        hunk_count = 0
+
     for line in diff.splitlines():
         if line.startswith("diff --git"):
-            if current_file:
-                files_patches.append((current_file, current_lines))
-            current_file = line
-            current_lines = []
-            line_count = 0
-        elif current_file:
-            line_count += 1
-            if line_count <= MAX_LINES_PER_FILE:
-                current_lines.append(line)
-            elif line_count == MAX_LINES_PER_FILE + 1:
-                current_lines.append("[... truncated]")
-    if current_file:
-        files_patches.append((current_file, current_lines))
-    parts = [f"DIFF STAT:\n{stat}\nTRUNCATED PATCHES:"]
-    for header, lines in files_patches:
-        parts.append(header)
-        parts.extend(lines)
+            flush_file()
+            current_file_header = line
+            hunk_count = 0
+        elif line.startswith("@@") and " @@" in line:
+            hunk_count += 1
+            hunk_lines = 0
+            hunk_truncated = False
+            if hunk_count <= MAX_HUNKS_PER_FILE:
+                current_file_lines.append(line)
+        elif current_file_header and hunk_count <= MAX_HUNKS_PER_FILE:
+            if line.startswith("---") or line.startswith("+++"):
+                current_file_lines.append(line)
+            elif line.startswith("rename ") or line.startswith("new file") or line.startswith("deleted file"):
+                current_file_lines.append(line)
+            elif hunk_lines < MAX_LINES_PER_HUNK:
+                if line.startswith("+") or line.startswith("-"):
+                    current_file_lines.append(line)
+                    hunk_lines += 1
+                elif line.startswith(" ") and hunk_lines < MAX_LINES_PER_HUNK // 2:
+                    current_file_lines.append(line)
+                    hunk_lines += 1
+            elif not hunk_truncated:
+                current_file_lines.append("[... hunk truncated]")
+                hunk_truncated = True
+
+    flush_file()
     return "\n".join(parts)
 
 
-def call_llm(config, diff):
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_RETRIES = 3
+
+
+def call_llm_raw(config, system_prompt, user_content):
+    """Make a raw LLM API call and return parsed JSON."""
     import requests
 
-    content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
+    use_structured = config.get("STRUCTURED_OUTPUT", "true").lower() == "true"
 
-    resp = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": config["MODEL"],
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            "temperature": 0,
-        },
-        timeout=60,
-    )
-    if resp.status_code != 200:
-        print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
+    request_body = {
+        "model": config["MODEL"],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0,
+    }
+    if use_structured:
+        request_body["response_format"] = {"type": "json_object"}
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
+                    "Content-Type": "application/json",
+                },
+                json=request_body,
+                timeout=60,
+            )
+            if resp.status_code == 200:
+                break
+            if resp.status_code in RETRYABLE_STATUS_CODES:
+                last_error = f"API returned {resp.status_code}: {resp.text[:200]}"
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = 2**attempt
+                    print(f"  retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                    time.sleep(wait_time)
+                    continue
+            print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
+            sys.exit(1)
+        except requests.exceptions.Timeout:
+            last_error = "request timed out"
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2**attempt
+                print(f"  request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                time.sleep(wait_time)
+                continue
+            print(f"error: LLM API request timed out after {MAX_RETRIES} attempts", file=sys.stderr)
+            sys.exit(1)
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2**attempt
+                print(f"  request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                time.sleep(wait_time)
+                continue
+            print(f"error: LLM API request failed after {MAX_RETRIES} attempts: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        print(f"error: LLM API failed after {MAX_RETRIES} attempts: {last_error}", file=sys.stderr)
         sys.exit(1)
-    content = resp.json()["choices"][0]["message"]["content"]
+    try:
+        resp_json = resp.json()
+    except json.JSONDecodeError as e:
+        print(f"error: failed to parse API response as JSON: {e}", file=sys.stderr)
+        print(f"  response: {resp.text[:500]}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        content = resp_json["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        print(f"error: unexpected API response structure: {e}", file=sys.stderr)
+        print(f"  response: {resp_json}", file=sys.stderr)
+        sys.exit(1)
     content = content.strip()
     if content.startswith("```"):
         content = "\n".join(content.split("\n")[1:])
     if content.endswith("```"):
         content = "\n".join(content.split("\n")[:-1])
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"error: LLM returned invalid JSON: {e}", file=sys.stderr)
+        print(f"  content: {content[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def call_llm(config, diff):
+    """Single-phase: send diff and get commits."""
+    content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
+    return call_llm_raw(config, SYSTEM_PROMPT, content)
+
+
+def call_llm_two_phase(config, diff_files):
+    """Two-phase approach for large diffs with many files.
+
+    Phase 1: Send file summary (name-status + stat) to get logical groupings
+    Phase 2: For each group, send actual diff to generate commit message
+    """
+    name_status, _, _ = run(["git", "diff", "--cached", "--name-status"])
+    stat, _, _ = run(["git", "diff", "--cached", "--stat"])
+
+    phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
+    print("  phase 1: grouping files...")
+    groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
+
+    commits = []
+    for i, group in enumerate(groups):
+        files = group.get("files", [])
+        if not files:
+            continue
+        print(f"  phase 2: generating message for group {i + 1}/{len(groups)}...")
+        group_diff = get_diff_for_files(files)
+        if not group_diff.strip():
+            continue
+        content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
+        result = call_llm_raw(config, PHASE2_PROMPT, content)
+        commits.append({"files": files, "message": result.get("message", "chore: update files")})
+
+    return commits
 
 
 def main():
@@ -153,25 +376,33 @@ def main():
         print("nothing to commit")
         return
 
-    print(f"analysing {source} changes...")
-    commits = call_llm(config, diff)
+    diff_files = parse_files_from_diff(diff)
+    file_count = len(diff_files)
+
+    print(f"analysing {source} changes ({file_count} files)...")
+    if file_count > LARGE_DIFF_FILES:
+        print(f"  using two-phase approach for large diff")
+        commits = call_llm_two_phase(config, diff_files)
+    else:
+        commits = call_llm(config, diff)
+    validate_commits(commits, diff_files)
 
     if source == "all":
-        subprocess.run(["git", "reset", "HEAD"], capture_output=True)
+        run(["git", "reset", "HEAD"], check=True)
 
     for commit in commits:
         files = commit["files"]
         message = commit["message"]
-        subprocess.run(["git", "add", "--"] + files, check=True)
-        result = subprocess.run(["git", "commit", "-m", message], capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"error: commit failed: {result.stderr}", file=sys.stderr)
+        run(["git", "add", "--"] + files, check=True)
+        _, stderr, code = run(["git", "commit", "-m", message])
+        if code != 0:
+            print(f"error: commit failed: {stderr}", file=sys.stderr)
             sys.exit(1)
         print(f"  {message}")
 
-    result = subprocess.run(["git", "push"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"error: push failed: {result.stderr}", file=sys.stderr)
+    _, stderr, code = run(["git", "push"])
+    if code != 0:
+        print(f"error: push failed: {stderr}", file=sys.stderr)
         sys.exit(1)
     print("pushed")
 
