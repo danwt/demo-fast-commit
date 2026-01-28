@@ -11,9 +11,75 @@ import json
 import subprocess
 import sys
 import time
+import traceback
+from datetime import datetime
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
+ERRORS_DIR = Path.home() / ".fastc" / "errors"
+
+
+def record_error(message, context=None):
+    """Record error details to disk for debugging.
+
+    Creates timestamped error files in the errors/ directory with:
+    - Error message
+    - Timestamp
+    - Git state (branch, status)
+    - Optional context dict
+    - Stack trace
+    """
+    ERRORS_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    error_file = ERRORS_DIR / f"error_{timestamp}.txt"
+
+    lines = [
+        f"timestamp: {datetime.now().isoformat()}",
+        f"error: {message}",
+        "",
+    ]
+
+    # Capture git state
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, timeout=5
+        )
+        branch = branch_result.stdout.decode().strip() if branch_result.returncode == 0 else "unknown"
+        lines.append(f"git_branch: {branch}")
+
+        status_result = subprocess.run(
+            ["git", "status", "--short"],
+            capture_output=True, timeout=5
+        )
+        if status_result.returncode == 0:
+            status = status_result.stdout.decode().strip()
+            lines.append(f"git_status:\n{status}")
+    except Exception:
+        lines.append("git_state: failed to capture")
+
+    lines.append("")
+
+    # Add context if provided
+    if context:
+        lines.append("context:")
+        for key, value in context.items():
+            lines.append(f"  {key}: {value}")
+        lines.append("")
+
+    # Add stack trace
+    lines.append("stack_trace:")
+    lines.append(traceback.format_exc())
+
+    error_file.write_text("\n".join(lines))
+    print(f"  error recorded: {error_file}", file=sys.stderr)
+
+
+def exit_with_error(message, context=None):
+    """Print error, record to disk, and exit."""
+    print(f"error: {message}", file=sys.stderr)
+    record_error(message, context)
+    sys.exit(1)
 
 # Files to exclude from diff analysis (don't help with commit messages)
 EXCLUDED_PATTERNS = [
@@ -94,9 +160,10 @@ Respond with ONLY a JSON object (no markdown, no explanation):
 
 def load_config():
     if not CONFIG_PATH.exists():
-        print(f"error: config not found at {CONFIG_PATH}", file=sys.stderr)
-        print(f"create it with OPENROUTER_API_KEY and MODEL", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error(
+            f"config not found at {CONFIG_PATH}. Create it with OPENROUTER_API_KEY and MODEL",
+            {"config_path": str(CONFIG_PATH)}
+        )
     config = {}
     for line in CONFIG_PATH.read_text().splitlines():
         line = line.strip()
@@ -105,11 +172,9 @@ def load_config():
         key, _, value = line.partition("=")
         config[key.strip()] = value.strip().strip("\"'")
     if "OPENROUTER_API_KEY" not in config:
-        print("error: OPENROUTER_API_KEY not set in config", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error("OPENROUTER_API_KEY not set in config", {"config_path": str(CONFIG_PATH)})
     if "MODEL" not in config:
-        print("error: MODEL not set in config", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error("MODEL not set in config", {"config_path": str(CONFIG_PATH)})
     return config
 
 
@@ -118,10 +183,10 @@ def run(cmd, check=False):
     stdout = result.stdout.decode("utf-8", errors="replace")
     stderr = result.stderr.decode("utf-8", errors="replace")
     if check and result.returncode != 0:
-        print(f"error: command failed: {' '.join(cmd)}", file=sys.stderr)
-        if stderr:
-            print(f"  {stderr.strip()}", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error(
+            f"command failed: {' '.join(cmd)}",
+            {"command": " ".join(cmd), "stderr": stderr.strip(), "returncode": result.returncode}
+        )
     return stdout, stderr, result.returncode
 
 
@@ -443,8 +508,10 @@ def call_llm_raw(config, system_prompt, user_content):
                     print(f"  retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
                     time.sleep(wait_time)
                     continue
-            print(f"error: LLM API returned {resp.status_code}: {resp.text}", file=sys.stderr)
-            sys.exit(1)
+            exit_with_error(
+                f"LLM API returned {resp.status_code}",
+                {"status_code": resp.status_code, "response": resp.text[:500], "model": config["MODEL"]}
+            )
         except requests.exceptions.Timeout:
             last_error = "request timed out"
             if attempt < MAX_RETRIES - 1:
@@ -452,8 +519,10 @@ def call_llm_raw(config, system_prompt, user_content):
                 print(f"  request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
                 time.sleep(wait_time)
                 continue
-            print(f"error: LLM API request timed out after {MAX_RETRIES} attempts", file=sys.stderr)
-            sys.exit(1)
+            exit_with_error(
+                f"LLM API request timed out after {MAX_RETRIES} attempts",
+                {"model": config["MODEL"], "attempts": MAX_RETRIES}
+            )
         except requests.exceptions.RequestException as e:
             last_error = str(e)
             if attempt < MAX_RETRIES - 1:
@@ -461,23 +530,29 @@ def call_llm_raw(config, system_prompt, user_content):
                 print(f"  request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
                 time.sleep(wait_time)
                 continue
-            print(f"error: LLM API request failed after {MAX_RETRIES} attempts: {e}", file=sys.stderr)
-            sys.exit(1)
+            exit_with_error(
+                f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
+                {"model": config["MODEL"], "attempts": MAX_RETRIES, "last_error": str(e)}
+            )
     else:
-        print(f"error: LLM API failed after {MAX_RETRIES} attempts: {last_error}", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error(
+            f"LLM API failed after {MAX_RETRIES} attempts: {last_error}",
+            {"model": config["MODEL"], "attempts": MAX_RETRIES, "last_error": last_error}
+        )
     try:
         resp_json = resp.json()
     except json.JSONDecodeError as e:
-        print(f"error: failed to parse API response as JSON: {e}", file=sys.stderr)
-        print(f"  response: {resp.text[:500]}", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error(
+            f"failed to parse API response as JSON: {e}",
+            {"response_text": resp.text[:1000], "model": config["MODEL"]}
+        )
     try:
         content = resp_json["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        print(f"error: unexpected API response structure: {e}", file=sys.stderr)
-        print(f"  response: {resp_json}", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error(
+            f"unexpected API response structure: {e}",
+            {"response_json": str(resp_json)[:1000], "model": config["MODEL"]}
+        )
     content = content.strip()
     if content.startswith("```"):
         content = "\n".join(content.split("\n")[1:])
@@ -509,9 +584,10 @@ def call_llm_raw(config, system_prompt, user_content):
         print("  warning: could not parse JSON object, returning empty dict")
         return {}
 
-    print(f"error: LLM returned unparseable response", file=sys.stderr)
-    print(f"  content: {content[:500]}", file=sys.stderr)
-    sys.exit(1)
+    exit_with_error(
+        "LLM returned unparseable response",
+        {"content": content[:1000], "model": config["MODEL"]}
+    )
 
 
 def call_llm(config, diff):
@@ -625,8 +701,7 @@ def main():
     commits = validate_and_fix_commits(commits, staged_files)
 
     if not commits:
-        print("error: no valid commits generated", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error("no valid commits generated", {"file_count": file_count})
 
     if args.dry_run:
         print("\ndry run - would create these commits:")
@@ -673,8 +748,10 @@ def main():
             commit_cmd += ["-m", description]
         _, stderr, code = run(commit_cmd)
         if code != 0:
-            print(f"error: commit failed: {stderr}", file=sys.stderr)
-            sys.exit(1)
+            exit_with_error(
+                f"commit failed: {stderr}",
+                {"message": message, "files": added_files, "stderr": stderr}
+            )
         print(f"  {message}")
 
     # Commit lockfiles separately with a simple message
@@ -682,8 +759,10 @@ def main():
         run(["git", "add", "--"] + lockfiles, check=True)
         _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
         if code != 0:
-            print(f"error: lockfile commit failed: {stderr}", file=sys.stderr)
-            sys.exit(1)
+            exit_with_error(
+                f"lockfile commit failed: {stderr}",
+                {"lockfiles": lockfiles, "stderr": stderr}
+            )
         print("  chore: update lockfiles")
 
     if args.no_push:
@@ -692,8 +771,7 @@ def main():
 
     _, stderr, code = run(["git", "push"])
     if code != 0:
-        print(f"error: push failed: {stderr}", file=sys.stderr)
-        sys.exit(1)
+        exit_with_error("push failed", {"stderr": stderr})
     print("pushed")
 
 
