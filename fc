@@ -254,11 +254,23 @@ def parse_files_from_diff(diff):
     return files
 
 
+def is_lockfile(path):
+    """Check if a file path matches any lockfile pattern."""
+    for pattern in EXCLUDED_PATTERNS:
+        if pattern.startswith("*"):
+            if path.endswith(pattern[1:]):
+                return True
+        elif path.endswith("/" + pattern) or path == pattern:
+            return True
+    return False
+
+
 def get_staged_files_for_commit():
-    """Get actual staged files that can be committed.
+    """Get actual staged files that can be committed (excluding lockfiles).
 
     Returns dict mapping new_path -> old_path (same if not renamed).
     This ensures we use paths that actually exist for git add.
+    Lockfiles are excluded since they're committed separately.
     """
     name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M"])
     files = {}
@@ -270,11 +282,14 @@ def get_staged_files_for_commit():
         if status.startswith("R"):  # Rename: R100\told\tnew
             old_path = parts[1]
             new_path = parts[2]
-            files[new_path] = old_path
+            if not is_lockfile(new_path):
+                files[new_path] = old_path
         elif status == "D":  # Deleted
-            files[parts[1]] = parts[1]
+            if not is_lockfile(parts[1]):
+                files[parts[1]] = parts[1]
         else:  # Added, Modified, etc
-            files[parts[1]] = parts[1]
+            if not is_lockfile(parts[1]):
+                files[parts[1]] = parts[1]
     return files
 
 
@@ -655,17 +670,7 @@ def call_llm_two_phase(config, staged_files):
 def get_lockfiles_in_staging():
     """Get list of lockfiles that are staged."""
     staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
-    lockfiles = []
-    for f in staged.strip().splitlines():
-        for pattern in EXCLUDED_PATTERNS:
-            if pattern.startswith("*"):
-                if f.endswith(pattern[1:]):
-                    lockfiles.append(f)
-                    break
-            elif f.endswith(pattern) or f == pattern:
-                lockfiles.append(f)
-                break
-    return lockfiles
+    return [f for f in staged.strip().splitlines() if f and is_lockfile(f)]
 
 
 def main():
@@ -757,13 +762,16 @@ def main():
     # Commit lockfiles separately with a simple message
     if lockfiles:
         run(["git", "add", "--"] + lockfiles, check=True)
-        _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
-        if code != 0:
-            exit_with_error(
-                f"lockfile commit failed: {stderr}",
-                {"lockfiles": lockfiles, "stderr": stderr}
-            )
-        print("  chore: update lockfiles")
+        # Verify something is actually staged before committing
+        staged_check, _, _ = run(["git", "diff", "--cached", "--name-only"])
+        if staged_check.strip():
+            _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
+            if code != 0:
+                exit_with_error(
+                    f"lockfile commit failed: {stderr}",
+                    {"lockfiles": lockfiles, "stderr": stderr}
+                )
+            print("  chore: update lockfiles")
 
     if args.no_push:
         print("done (push skipped)")
