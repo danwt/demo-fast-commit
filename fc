@@ -330,6 +330,17 @@ def normalize_llm_files(llm_files, staged_files):
     return normalized
 
 
+def is_echoing_keys(commit):
+    """Check if commit has literal key strings instead of real values."""
+    files = commit.get("files")
+    message = commit.get("message")
+    if isinstance(files, str) and files in ("files", "[]", ""):
+        return True
+    if isinstance(message, str) and message in ("message", ""):
+        return True
+    return False
+
+
 def validate_and_fix_commits(commits, staged_files):
     """Validate LLM output and fix issues.
 
@@ -338,6 +349,14 @@ def validate_and_fix_commits(commits, staged_files):
     - Errors if any files are missing from groupings
     - Returns fixed list of commits
     """
+    # Detect key-echoing pattern (model failure)
+    echo_count = sum(1 for c in commits if is_echoing_keys(c))
+    if echo_count > 0 and echo_count == len(commits):
+        exit_with_error(
+            f"LLM returned malformed commits (echoing keys: {echo_count}/{len(commits)})",
+            {"commits_sample": commits[:3]}
+        )
+
     all_staged = set(staged_files.keys())
     covered_files = set()
     fixed_commits = []
@@ -349,7 +368,7 @@ def validate_and_fix_commits(commits, staged_files):
 
         normalized = normalize_llm_files(commit["files"], staged_files)
         if not normalized:
-            print(f"  warning: skipping commit with no valid files: {commit['message']}", file=sys.stderr)
+            print(f"  warning: skipping commit with no valid files: {commit.get('message', '<missing>')}", file=sys.stderr)
             continue
 
         covered_files.update(normalized)
