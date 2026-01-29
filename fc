@@ -319,7 +319,7 @@ def validate_and_fix_commits(commits, staged_files):
 
     - Normalizes file paths (handles renames)
     - Removes invalid files
-    - Adds missing files to a catch-all commit
+    - Errors if any files are missing from groupings
     - Returns fixed list of commits
     """
     all_staged = set(staged_files.keys())
@@ -345,12 +345,10 @@ def validate_and_fix_commits(commits, staged_files):
 
     missing_files = all_staged - covered_files
     if missing_files:
-        print(f"  {len(missing_files)} files not grouped by LLM, adding to catch-all commit")
-        fixed_commits.append({
-            "files": list(missing_files),
-            "message": "chore: update remaining files",
-            "description": "",
-        })
+        exit_with_error(
+            f"LLM failed to group {len(missing_files)} files: {list(missing_files)[:5]}{'...' if len(missing_files) > 5 else ''}",
+            {"missing_files": list(missing_files), "staged_files": list(all_staged)}
+        )
 
     return fixed_commits
 
@@ -591,16 +589,8 @@ def call_llm_raw(config, system_prompt, user_content):
     if repaired is not None:
         return repaired
 
-    # Last resort: return empty list for arrays, empty dict for objects
-    if content.lstrip().startswith("["):
-        print("  warning: could not parse JSON array, returning empty list")
-        return []
-    elif content.lstrip().startswith("{"):
-        print("  warning: could not parse JSON object, returning empty dict")
-        return {}
-
     exit_with_error(
-        "LLM returned unparseable response",
+        "LLM returned unparseable JSON",
         {"content": content[:1000], "model": config["MODEL"]}
     )
 
@@ -631,8 +621,10 @@ def call_llm_two_phase(config, staged_files):
         groups = groups.get("groups", groups.get("commits", []))
 
     if not isinstance(groups, list):
-        print("  warning: LLM returned non-list, treating all files as one group")
-        groups = [{"files": list(staged_files.keys()), "hint": "all changes"}]
+        exit_with_error(
+            "LLM phase1 returned non-list response",
+            {"response_type": type(groups).__name__, "staged_files": list(staged_files.keys())}
+        )
 
     commits = []
     for i, group in enumerate(groups):
@@ -655,12 +647,18 @@ def call_llm_two_phase(config, staged_files):
         result = call_llm_raw(config, PHASE2_PROMPT, content)
 
         # Handle various response formats
-        if isinstance(result, dict):
-            message = result.get("message", "chore: update files")
-            description = result.get("description", "")
-        else:
-            message = "chore: update files"
-            description = ""
+        if not isinstance(result, dict):
+            exit_with_error(
+                f"LLM phase2 returned non-dict response for group {i + 1}",
+                {"response_type": type(result).__name__, "files": normalized}
+            )
+        message = result.get("message")
+        if not message:
+            exit_with_error(
+                f"LLM phase2 missing message field for group {i + 1}",
+                {"files": normalized, "response": result}
+            )
+        description = result.get("description", "")
 
         commits.append({"files": normalized, "message": message, "description": description})
 
