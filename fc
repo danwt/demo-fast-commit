@@ -284,8 +284,8 @@ def is_lockfile(path):
 def get_staged_files_for_commit():
     """Get actual staged files that can be committed (excluding lockfiles).
 
-    Returns dict mapping new_path -> old_path (same if not renamed).
-    This ensures we use paths that actually exist for git add.
+    Returns dict mapping path -> {old_path, is_deleted}
+    This ensures we use paths that actually exist for git add/rm.
     Lockfiles are excluded since they're committed separately.
     """
     name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M"])
@@ -299,13 +299,13 @@ def get_staged_files_for_commit():
             old_path = parts[1]
             new_path = parts[2]
             if not is_lockfile(new_path):
-                files[new_path] = old_path
+                files[new_path] = {"old": old_path, "deleted": False}
         elif status == "D":  # Deleted
             if not is_lockfile(parts[1]):
-                files[parts[1]] = parts[1]
+                files[parts[1]] = {"old": parts[1], "deleted": True}
         else:  # Added, Modified, etc
             if not is_lockfile(parts[1]):
-                files[parts[1]] = parts[1]
+                files[parts[1]] = {"old": parts[1], "deleted": False}
     return files
 
 
@@ -316,7 +316,7 @@ def normalize_llm_files(llm_files, staged_files):
     This maps them to actual paths that git can work with.
     """
     # Build reverse lookup: old_path -> new_path
-    old_to_new = {old: new for new, old in staged_files.items()}
+    old_to_new = {info["old"]: path for path, info in staged_files.items()}
 
     normalized = []
     for f in llm_files:
@@ -328,6 +328,12 @@ def normalize_llm_files(llm_files, staged_files):
             normalized.append(old_to_new[f])
         # Skip files that don't exist at all (hallucinated or already committed)
     return normalized
+
+
+def is_file_deleted(path, staged_files):
+    """Check if a file is marked as deleted in staged files."""
+    info = staged_files.get(path)
+    return info["deleted"] if info else False
 
 
 def is_echoing_keys(commit):
@@ -801,10 +807,13 @@ def main():
         message = commit["message"]
         description = commit.get("description", "")
 
-        # Add files one by one to handle missing files gracefully
+        # Stage files - use git rm for deleted files, git add for others
         added_files = []
         for f in files:
-            _, stderr, code = run(["git", "add", "--", f])
+            if is_file_deleted(f, staged_files):
+                _, stderr, code = run(["git", "rm", "--", f])
+            else:
+                _, stderr, code = run(["git", "add", "--", f])
             if code == 0:
                 added_files.append(f)
             else:
