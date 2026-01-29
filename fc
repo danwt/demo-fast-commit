@@ -671,7 +671,7 @@ def call_llm(config, diff):
     # Retry with stronger prompt if response looks malformed
     if is_malformed_response(result):
         print("  response looks malformed, retrying with stronger prompt...")
-        result = call_llm_raw(config, RETRY_PROMPT + "\n\n" + content[:5000])
+        result = call_llm_raw(config, RETRY_PROMPT, content[:5000])
 
     return result
 
