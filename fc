@@ -29,7 +29,7 @@ def record_error(message, context=None):
     - Optional context dict
     - Stack trace
     """
-    ERRORS_DIR.mkdir(exist_ok=True)
+    ERRORS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     error_file = ERRORS_DIR / f"error_{timestamp}.txt"
 
@@ -103,6 +103,12 @@ EXCLUDED_PATTERNS = [
 
 SYSTEM_PROMPT = """You are a git commit message generator. Given a git diff, analyse the changes and group them into logical atomic commits.
 
+CRITICAL REQUIREMENTS:
+- "files" MUST be actual file paths from the diff (e.g., "src/auth.go", "tests/auth_test.go")
+- "message" MUST be a real commit message, NOT the word "message"
+- "description" MUST be a real description, NOT the word "description"
+- Every file in the diff MUST appear in exactly one commit's files array
+
 Rules:
 - Each commit should represent one logical change
 - Use conventional commit format: <type>(<scope>): <subject>
@@ -112,20 +118,26 @@ Rules:
 - Group files that belong to the same logical change together
 - If all changes are one logical unit, return a single commit
 
-Respond with ONLY a JSON array (no markdown, no explanation):
+BAD OUTPUT (will be rejected):
+[
+  {"files": "files", "message": "message", "description": "description"}
+]
+
+GOOD OUTPUT:
 [
   {
-    "files": ["path/to/file1", "path/to/file2"],
+    "files": ["src/auth.go", "tests/auth_test.go"],
     "message": "feat(auth): add login endpoint",
-    "description": "Users need to authenticate before accessing protected resources. This adds the initial login flow with session management."
+    "description": "Users need to authenticate before accessing protected resources."
   }
 ]
 
-If a file is deleted, still include it in the files list - git add handles deletions.
-If a file is renamed, include both old and new paths.
-"""
+Respond with ONLY a valid JSON array (no markdown, no explanation):"""
 
 PHASE1_PROMPT = """You are a git commit analyzer. Given a summary of changed files (name-status and stats), group them into logical atomic commits.
+
+CRITICAL REQUIREMENT:
+- "files" MUST be actual file paths from the FILE CHANGES list below
 
 Rules:
 - Each group should represent one logical change
@@ -133,16 +145,19 @@ Rules:
 - If all changes are one logical unit, return a single group
 - Use the file paths and change types (A=added, M=modified, D=deleted, R=renamed) to understand the changes
 
-Respond with ONLY a JSON array of file groups (no markdown, no explanation):
-[
-  {
-    "files": ["path/to/file1", "path/to/file2"],
-    "hint": "brief description of what these files do together"
-  }
-]
-"""
+BAD OUTPUT (will be rejected):
+[{"files": "files", "hint": "hint"}]
+
+GOOD OUTPUT:
+[{"files": ["src/auth.go", "tests/auth_test.go"], "hint": "authentication logic changes"}]
+
+Respond with ONLY a valid JSON array of file groups (no markdown, no explanation):"""
 
 PHASE2_PROMPT = """You are a git commit message generator. Given a diff for a specific group of related files, generate ONE commit message.
+
+CRITICAL REQUIREMENTS:
+- "message" MUST be a real commit message, NOT the word "message"
+- "description" MUST be a real description, NOT the word "description"
 
 Rules:
 - Use conventional commit format: <type>(<scope>): <subject>
@@ -150,12 +165,13 @@ Rules:
 - Subject: imperative mood, max 50 chars, no period
 - Description: 1-3 sentences explaining WHY the change was made, not what changed
 
-Respond with ONLY a JSON object (no markdown, no explanation):
-{
-  "message": "feat(auth): add login endpoint",
-  "description": "Users need to authenticate before accessing protected resources. This adds the initial login flow with session management."
-}
-"""
+BAD OUTPUT (will be rejected):
+{"message": "message", "description": "description"}
+
+GOOD OUTPUT:
+{"message": "feat(auth): add login endpoint", "description": "Users need to authenticate before accessing protected resources."}
+
+Respond with ONLY a valid JSON object (no markdown, no explanation):"""
 
 
 def load_config():
