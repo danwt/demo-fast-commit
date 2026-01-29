@@ -630,10 +630,44 @@ def call_llm_raw(config, system_prompt, user_content):
     )
 
 
+RETRY_PROMPT = """You MUST output REAL file paths and REAL commit messages.
+
+Example of what NOT to do (will be rejected):
+[{"files": "files", "message": "message", "description": "description"}]
+
+Example of what you MUST do:
+[{"files": ["src/main.go", "src/config.go"], "message": "feat(config): add app settings", "description": "Add runtime configuration support"}]
+
+CRITICAL: Every file in the diff below must appear in the files array.
+Output ONLY valid JSON array with no markdown fences:"""
+
+
+def is_malformed_response(result):
+    """Check if response is clearly malformed (key echoing or invalid structure)."""
+    if not isinstance(result, list):
+        return True
+    if not result:
+        return True
+    # Check if all commits have key-echoing pattern
+    echo_count = sum(1 for r in result if isinstance(r, dict) and (
+        r.get("files") in ("files", "[]", "") or
+        r.get("message") in ("message", "") or
+        r.get("description") in ("description", "")
+    ))
+    return echo_count > len(result) // 2
+
+
 def call_llm(config, diff):
     """Single-phase: send diff and get commits."""
     content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
-    return call_llm_raw(config, SYSTEM_PROMPT, content)
+    result = call_llm_raw(config, SYSTEM_PROMPT, content)
+
+    # Retry with stronger prompt if response looks malformed
+    if is_malformed_response(result):
+        print("  response looks malformed, retrying with stronger prompt...")
+        result = call_llm_raw(config, RETRY_PROMPT + "\n\n" + content[:5000])
+
+    return result
 
 
 def call_llm_two_phase(config, staged_files):
