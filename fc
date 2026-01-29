@@ -338,6 +338,8 @@ def is_file_deleted(path, staged_files):
 
 def is_echoing_keys(commit):
     """Check if commit has literal key strings instead of real values."""
+    if not isinstance(commit, dict):
+        return True
     files = commit.get("files")
     message = commit.get("message")
     if isinstance(files, str) and files in ("files", "[]", ""):
@@ -655,11 +657,7 @@ def is_malformed_response(result):
     if not result:
         return True
     # Check if all commits have key-echoing pattern
-    echo_count = sum(1 for r in result if isinstance(r, dict) and (
-        r.get("files") in ("files", "[]", "") or
-        r.get("message") in ("message", "") or
-        r.get("description") in ("description", "")
-    ))
+    echo_count = sum(1 for r in result if is_echoing_keys(r))
     return echo_count > len(result) // 2
 
 
