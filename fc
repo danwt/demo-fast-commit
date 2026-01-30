@@ -80,7 +80,7 @@ def log_git_state():
 
 
 def warn(message, context=None):
-    """Print warning to user and log it."""
+    """Print warning to user and log it (uses INFO level, not WARN)."""
     print(f"  warning: {message}", file=sys.stderr)
     log("INFO", message, context)
 
@@ -791,105 +791,6 @@ def call_llm(config, diff):
         result = normalize_llm_result(result)
 
     return result
-
-
-class FileTreeNode:
-    """A node in the file tree representing a directory or file."""
-
-    def __init__(self, name, is_file=False):
-        self.name = name
-        self.is_file = is_file
-        self.children = {}  # name -> FileTreeNode
-        self.files = []  # list of full paths if this is a grouping node
-        self.operation = None  # 'add', 'delete', 'rename', 'modify', or 'mixed'
-        self.rename_dest = None  # For renames: the destination path prefix
-
-
-def build_file_tree(staged_files):
-    """Build a tree structure from file paths with operation metadata.
-
-    Returns root node of the tree.
-    """
-    root = FileTreeNode("", is_file=False)
-
-    for path, info in staged_files.items():
-        parts = path.split("/")
-        current = root
-
-        # Determine operation type
-        old_path = info.get("old", path)
-        if info.get("deleted"):
-            op = "delete"
-        elif old_path != path:
-            op = "rename"
-        else:
-            op = "add"  # or modify, but we treat new staging as add
-
-        # Build path in tree
-        for i, part in enumerate(parts):
-            if part not in current.children:
-                is_file = (i == len(parts) - 1)
-                current.children[part] = FileTreeNode(part, is_file=is_file)
-            current = current.children[part]
-
-        current.operation = op
-        current.files = [path]
-        if op == "rename":
-            current.rename_dest = old_path
-
-
-def analyze_tree_operations(node, path_prefix=""):
-    """Recursively analyze tree to find directory-level operations.
-
-    Returns list of (operation_type, path, file_list, extra_info)
-    """
-    if node.is_file:
-        return [(node.operation, path_prefix, node.files, node.rename_dest)]
-
-    # Collect operations from all children
-    child_ops = []
-    all_files = []
-
-    for name, child in node.children.items():
-        child_path = f"{path_prefix}/{name}" if path_prefix else name
-        ops = analyze_tree_operations(child, child_path)
-        child_ops.extend(ops)
-        for op, _, files, _ in ops:
-            all_files.extend(files)
-
-    if not child_ops:
-        return []
-
-    # Check if all children have the same operation type
-    op_types = set(op for op, _, _, _ in child_ops)
-
-    if len(op_types) == 1:
-        op_type = op_types.pop()
-
-        # Check if this is a directory-level rename (all files renamed with same prefix change)
-        if op_type == "rename":
-            # Analyze rename patterns
-            rename_sources = [extra for _, _, _, extra in child_ops if extra]
-            if rename_sources:
-                # Find common source prefix
-                source_prefixes = set()
-                for src in rename_sources:
-                    parts = src.split("/")
-                    if len(parts) > 1:
-                        source_prefixes.add("/".join(parts[:-1]))
-                    else:
-                        source_prefixes.add("")
-
-                if len(source_prefixes) == 1:
-                    # All files came from the same source directory
-                    src_prefix = source_prefixes.pop()
-                    return [(op_type, path_prefix, all_files, src_prefix)]
-
-        # All children have same operation - bubble up as directory operation
-        return [(op_type, path_prefix, all_files, None)]
-
-    # Mixed operations - return as-is
-    return child_ops
 
 
 def detect_directory_moves(staged_files):
