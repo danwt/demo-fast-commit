@@ -37,7 +37,7 @@ def get_session_log():
 def log(level, message, context=None):
     """Log a message to the session log file.
 
-    Levels: INFO, WARN, ERROR
+    Levels: DEBUG, INFO, ERROR
     """
     log_file = get_session_log()
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -68,13 +68,13 @@ def log_git_state():
             if status:
                 log("INFO", f"git status:\n{status}")
     except Exception as e:
-        log("WARN", f"failed to capture git state: {e}")
+        log("INFO", f"failed to capture git state: {e}")
 
 
 def warn(message, context=None):
     """Print warning to user and log it."""
     print(f"  warning: {message}", file=sys.stderr)
-    log("WARN", message, context)
+    log("INFO", message, context)
 
 
 def record_error(message, context=None):
