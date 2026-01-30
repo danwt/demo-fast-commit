@@ -314,20 +314,23 @@ def normalize_llm_files(llm_files, staged_files):
 
     The LLM might return old paths for renamed files or paths that don't exist.
     This maps them to actual paths that git can work with.
+    Returns deduplicated list.
     """
+    if not isinstance(llm_files, list):
+        return []
+
     # Build reverse lookup: old_path -> new_path
     old_to_new = {info["old"]: path for path, info in staged_files.items()}
 
-    normalized = []
+    normalized = set()
     for f in llm_files:
+        if not isinstance(f, str):
+            continue
         if f in staged_files:
-            # File exists as-is (new path or unchanged)
-            normalized.append(f)
+            normalized.add(f)
         elif f in old_to_new:
-            # LLM returned old path of renamed file, use new path
-            normalized.append(old_to_new[f])
-        # Skip files that don't exist at all (hallucinated or already committed)
-    return normalized
+            normalized.add(old_to_new[f])
+    return list(normalized)
 
 
 def is_file_deleted(path, staged_files):
@@ -342,10 +345,26 @@ def is_echoing_keys(commit):
         return True
     files = commit.get("files")
     message = commit.get("message")
-    if isinstance(files, str) and files in ("files", "[]", ""):
+    description = commit.get("description")
+
+    # Check if files is invalid
+    if files is None:
         return True
-    if isinstance(message, str) and message in ("message", ""):
+    if isinstance(files, str) and files in ("files", "[]", "", "file"):
         return True
+    if isinstance(files, list) and len(files) == 0:
+        return True
+
+    # Check if message is just echoing the key name
+    if message is None:
+        return True
+    if isinstance(message, str) and message.lower() in ("message", "", "commit message", "msg"):
+        return True
+
+    # Check if description is just echoing the key name
+    if isinstance(description, str) and description.lower() in ("description", "desc"):
+        return True
+
     return False
 
 
@@ -370,6 +389,9 @@ def validate_and_fix_commits(commits, staged_files):
     fixed_commits = []
 
     for commit in commits:
+        if not isinstance(commit, dict):
+            print(f"  warning: skipping non-dict commit: {commit}", file=sys.stderr)
+            continue
         if "files" not in commit or "message" not in commit:
             print(f"  warning: skipping malformed commit: {commit}", file=sys.stderr)
             continue
@@ -388,10 +410,18 @@ def validate_and_fix_commits(commits, staged_files):
 
     missing_files = all_staged - covered_files
     if missing_files:
-        exit_with_error(
-            f"LLM failed to group {len(missing_files)} files: {list(missing_files)[:5]}{'...' if len(missing_files) > 5 else ''}",
-            {"missing_files": list(missing_files), "staged_files": list(all_staged)}
-        )
+        # Add missing files to the last commit or create a new one
+        if fixed_commits:
+            print(f"  warning: LLM missed {len(missing_files)} files, adding to last commit", file=sys.stderr)
+            fixed_commits[-1]["files"].extend(list(missing_files))
+        else:
+            # No valid commits at all - create a fallback single commit
+            print(f"  warning: LLM failed to group files, creating single commit", file=sys.stderr)
+            fixed_commits.append({
+                "files": list(all_staged),
+                "message": "chore: update files",
+                "description": "",
+            })
 
     return fixed_commits
 
@@ -473,13 +503,33 @@ MAX_RETRIES = 3
 
 
 def try_repair_json(content):
-    """Attempt to repair truncated JSON arrays/objects.
+    """Attempt to repair truncated or malformed JSON arrays/objects.
 
-    Common truncation patterns:
-    - Array cut mid-string: [..., "file  -> close string and array
-    - Array cut mid-object: [..., {"files": ["a"]  -> close object and array
+    Common issues:
+    - Leading garbage: .[{...  or ```json[{...
+    - Trailing garbage: }]...  or }]```
+    - Truncated mid-string: [..., "file  -> close string and array
+    - Truncated mid-object: [..., {"files": ["a"]  -> close object and array
     """
-    content = content.rstrip()
+    content = content.strip()
+
+    # Strip leading garbage - find first [ or {
+    start_idx = -1
+    for i, c in enumerate(content):
+        if c in '[{':
+            start_idx = i
+            break
+    if start_idx > 0:
+        content = content[start_idx:]
+
+    # Strip trailing garbage - find last ] or }
+    end_idx = -1
+    for i in range(len(content) - 1, -1, -1):
+        if content[i] in ']}':
+            end_idx = i
+            break
+    if end_idx >= 0 and end_idx < len(content) - 1:
+        content = content[:end_idx + 1]
 
     # Try as-is first
     try:
@@ -661,15 +711,38 @@ def is_malformed_response(result):
     return echo_count > len(result) // 2
 
 
+def normalize_llm_result(result):
+    """Normalize LLM result to a list of commits.
+
+    Handles various response formats:
+    - Direct array: [{...}, {...}]
+    - Object with commits key: {"commits": [{...}]}
+    - Object with groups key: {"groups": [{...}]}
+    - Single commit object: {"files": [...], "message": "..."}
+    """
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        if "commits" in result:
+            return result["commits"]
+        if "groups" in result:
+            return result["groups"]
+        if "files" in result and "message" in result:
+            return [result]
+    return []
+
+
 def call_llm(config, diff):
     """Single-phase: send diff and get commits."""
     content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
     result = call_llm_raw(config, SYSTEM_PROMPT, content)
+    result = normalize_llm_result(result)
 
     # Retry with stronger prompt if response looks malformed
     if is_malformed_response(result):
         print("  response looks malformed, retrying with stronger prompt...")
         result = call_llm_raw(config, RETRY_PROMPT, content[:5000])
+        result = normalize_llm_result(result)
 
     return result
 
@@ -694,10 +767,12 @@ def call_llm_two_phase(config, staged_files):
         groups = groups.get("groups", groups.get("commits", []))
 
     if not isinstance(groups, list):
-        exit_with_error(
-            "LLM phase1 returned non-list response",
-            {"response_type": type(groups).__name__, "staged_files": list(staged_files.keys())}
-        )
+        print(f"  warning: phase1 returned non-list ({type(groups).__name__}), falling back to single commit", file=sys.stderr)
+        groups = []
+
+    if not groups:
+        # Fallback: put all files in one group
+        groups = [{"files": list(staged_files.keys()), "hint": "all changes"}]
 
     commits = []
     for i, group in enumerate(groups):
@@ -719,19 +794,19 @@ def call_llm_two_phase(config, staged_files):
         content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
         result = call_llm_raw(config, PHASE2_PROMPT, content)
 
-        # Handle various response formats
+        # Handle various response formats - extract dict from list if needed
+        if isinstance(result, list) and len(result) > 0:
+            result = result[0]
         if not isinstance(result, dict):
-            exit_with_error(
-                f"LLM phase2 returned non-dict response for group {i + 1}",
-                {"response_type": type(result).__name__, "files": normalized}
-            )
+            print(f"  warning: phase2 returned non-dict for group {i + 1}, skipping", file=sys.stderr)
+            continue
         message = result.get("message")
-        if not message:
-            exit_with_error(
-                f"LLM phase2 missing message field for group {i + 1}",
-                {"files": normalized, "response": result}
-            )
+        if not message or message.lower() in ("message", ""):
+            print(f"  warning: phase2 missing message for group {i + 1}, using fallback", file=sys.stderr)
+            message = "chore: update files"
         description = result.get("description", "")
+        if description.lower() in ("description", "desc"):
+            description = ""
 
         commits.append({"files": normalized, "message": message, "description": description})
 
