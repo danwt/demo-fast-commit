@@ -793,29 +793,304 @@ def call_llm(config, diff):
     return result
 
 
-def group_files_by_directory(staged_files):
-    """Group files by their top-level directory for bulk commits.
+class FileTreeNode:
+    """A node in the file tree representing a directory or file."""
 
-    Returns list of groups with files and auto-generated hints.
+    def __init__(self, name, is_file=False):
+        self.name = name
+        self.is_file = is_file
+        self.children = {}  # name -> FileTreeNode
+        self.files = []  # list of full paths if this is a grouping node
+        self.operation = None  # 'add', 'delete', 'rename', 'modify', or 'mixed'
+        self.rename_dest = None  # For renames: the destination path prefix
+
+
+def build_file_tree(staged_files):
+    """Build a tree structure from file paths with operation metadata.
+
+    Returns root node of the tree.
+    """
+    root = FileTreeNode("", is_file=False)
+
+    for path, info in staged_files.items():
+        parts = path.split("/")
+        current = root
+
+        # Determine operation type
+        old_path = info.get("old", path)
+        if info.get("deleted"):
+            op = "delete"
+        elif old_path != path:
+            op = "rename"
+        else:
+            op = "add"  # or modify, but we treat new staging as add
+
+        # Build path in tree
+        for i, part in enumerate(parts):
+            if part not in current.children:
+                is_file = (i == len(parts) - 1)
+                current.children[part] = FileTreeNode(part, is_file=is_file)
+            current = current.children[part]
+
+        current.operation = op
+        current.files = [path]
+        if op == "rename":
+            current.rename_dest = old_path
+
+
+def analyze_tree_operations(node, path_prefix=""):
+    """Recursively analyze tree to find directory-level operations.
+
+    Returns list of (operation_type, path, file_list, extra_info)
+    """
+    if node.is_file:
+        return [(node.operation, path_prefix, node.files, node.rename_dest)]
+
+    # Collect operations from all children
+    child_ops = []
+    all_files = []
+
+    for name, child in node.children.items():
+        child_path = f"{path_prefix}/{name}" if path_prefix else name
+        ops = analyze_tree_operations(child, child_path)
+        child_ops.extend(ops)
+        for op, _, files, _ in ops:
+            all_files.extend(files)
+
+    if not child_ops:
+        return []
+
+    # Check if all children have the same operation type
+    op_types = set(op for op, _, _, _ in child_ops)
+
+    if len(op_types) == 1:
+        op_type = op_types.pop()
+
+        # Check if this is a directory-level rename (all files renamed with same prefix change)
+        if op_type == "rename":
+            # Analyze rename patterns
+            rename_sources = [extra for _, _, _, extra in child_ops if extra]
+            if rename_sources:
+                # Find common source prefix
+                source_prefixes = set()
+                for src in rename_sources:
+                    parts = src.split("/")
+                    if len(parts) > 1:
+                        source_prefixes.add("/".join(parts[:-1]))
+                    else:
+                        source_prefixes.add("")
+
+                if len(source_prefixes) == 1:
+                    # All files came from the same source directory
+                    src_prefix = source_prefixes.pop()
+                    return [(op_type, path_prefix, all_files, src_prefix)]
+
+        # All children have same operation - bubble up as directory operation
+        return [(op_type, path_prefix, all_files, None)]
+
+    # Mixed operations - return as-is
+    return child_ops
+
+
+def detect_directory_moves(staged_files):
+    """Detect directory-level rename/move operations.
+
+    Analyzes rename patterns to find cases like:
+    - tla-dump/a/x.txt -> refs/tla-dump/a/x.txt (move tla-dump/ under refs/)
+    - old-name/x.txt -> new-name/x.txt (rename directory)
+
+    Returns dict of {destination_prefix: (source_prefix, [files])}
     """
     from collections import defaultdict
-    dir_groups = defaultdict(list)
 
-    for path in staged_files.keys():
-        parts = path.split("/")
-        if len(parts) > 1:
-            top_dir = parts[0]
+    # Group renames by the transformation pattern
+    # Key: (source_prefix, dest_prefix), Value: list of file paths
+    transforms = defaultdict(list)
+
+    for path, info in staged_files.items():
+        old_path = info.get("old", path)
+        if old_path == path or info.get("deleted"):
+            continue  # Not a rename
+
+        old_parts = old_path.split("/")
+        new_parts = path.split("/")
+
+        # Find longest common suffix (the unchanged part of the path)
+        common_suffix_len = 0
+        for i in range(1, min(len(old_parts), len(new_parts)) + 1):
+            if old_parts[-i] == new_parts[-i]:
+                common_suffix_len = i
+            else:
+                break
+
+        if common_suffix_len > 0:
+            old_prefix = "/".join(old_parts[:-common_suffix_len])
+            new_prefix = "/".join(new_parts[:-common_suffix_len])
         else:
-            top_dir = "root"
-        dir_groups[top_dir].append(path)
+            # No common suffix, use parent directories
+            old_prefix = "/".join(old_parts[:-1])
+            new_prefix = "/".join(new_parts[:-1])
 
-    groups = []
-    for dir_name, files in sorted(dir_groups.items()):
-        groups.append({
+        transforms[(old_prefix, new_prefix)].append(path)
+
+    # Filter to significant moves (3+ files)
+    return {
+        new_prefix: (old_prefix, files)
+        for (old_prefix, new_prefix), files in transforms.items()
+        if len(files) >= 3
+    }
+
+
+def summarize_file_operations(staged_files):
+    """Analyze staged files and return high-level operation summaries.
+
+    Returns list of dicts with:
+    - files: list of file paths
+    - message: commit message
+    - description: optional description
+    """
+    from collections import defaultdict
+
+    operations = []
+    handled_files = set()
+
+    # 1. Detect directory moves/renames
+    dir_moves = detect_directory_moves(staged_files)
+    for new_prefix, (old_prefix, files) in sorted(dir_moves.items(), key=lambda x: -len(x[1])):
+        # Skip already handled files
+        files = [f for f in files if f not in handled_files]
+        if len(files) < 3:
+            continue
+
+        handled_files.update(files)
+
+        # Generate message
+        old_name = old_prefix.split("/")[-1] if old_prefix else "files"
+        new_name = new_prefix.split("/")[-1] if new_prefix else "root"
+
+        if old_prefix and new_prefix:
+            if old_name == new_name:
+                # Same name, different location = move
+                msg = f"refactor: move {old_prefix}/ to {new_prefix}/"
+            else:
+                # Different name = rename
+                msg = f"refactor: rename {old_prefix}/ to {new_prefix}/"
+        elif new_prefix:
+            msg = f"refactor: move files into {new_prefix}/"
+        else:
+            msg = f"refactor: move {old_prefix}/ to root"
+
+        operations.append({
             "files": files,
-            "hint": f"changes in {dir_name}/"
+            "message": msg,
+            "description": f"{len(files)} files moved"
         })
-    return groups
+
+    # 2. Group remaining files by operation type and directory
+    remaining = {p: info for p, info in staged_files.items() if p not in handled_files}
+
+    # Categorize by operation
+    by_op_and_dir = defaultdict(lambda: defaultdict(list))
+    for path, info in remaining.items():
+        if info.get("deleted"):
+            op = "delete"
+        elif info.get("old") != path:
+            op = "rename"
+        else:
+            op = "add"
+
+        # Get directory (try different levels of granularity)
+        parts = path.split("/")
+        if len(parts) > 2:
+            dir_key = "/".join(parts[:2])  # Two levels deep
+        elif len(parts) > 1:
+            dir_key = parts[0]
+        else:
+            dir_key = "root"
+
+        by_op_and_dir[op][dir_key].append(path)
+
+    # Generate operations for deletions
+    for dir_key, files in by_op_and_dir["delete"].items():
+        if len(files) >= 3:
+            operations.append({
+                "files": files,
+                "message": f"chore: remove {dir_key}/",
+                "description": f"{len(files)} files deleted"
+            })
+            handled_files.update(files)
+        else:
+            for f in files:
+                fname = f.split("/")[-1]
+                operations.append({
+                    "files": [f],
+                    "message": f"chore: remove {fname}",
+                    "description": ""
+                })
+                handled_files.add(f)
+
+    # Generate operations for additions
+    for dir_key, files in by_op_and_dir["add"].items():
+        if len(files) >= 3:
+            operations.append({
+                "files": files,
+                "message": f"feat: add {dir_key}/",
+                "description": f"{len(files)} files added"
+            })
+            handled_files.update(files)
+        else:
+            for f in files:
+                fname = f.split("/")[-1]
+                operations.append({
+                    "files": [f],
+                    "message": f"feat: add {fname}",
+                    "description": ""
+                })
+                handled_files.add(f)
+
+    # Generate operations for remaining renames (not part of a dir move)
+    for dir_key, files in by_op_and_dir["rename"].items():
+        if len(files) >= 3:
+            operations.append({
+                "files": files,
+                "message": f"refactor: rename files in {dir_key}/",
+                "description": f"{len(files)} files renamed"
+            })
+            handled_files.update(files)
+        else:
+            for f in files:
+                fname = f.split("/")[-1]
+                operations.append({
+                    "files": [f],
+                    "message": f"refactor: rename {fname}",
+                    "description": ""
+                })
+                handled_files.add(f)
+
+    return operations
+
+
+def group_files_by_directory(staged_files):
+    """Smart grouping that detects directory-level operations.
+
+    Uses file tree analysis to understand bulk operations like:
+    - Directory renames/moves
+    - Bulk deletions
+    - Bulk additions
+
+    Returns list of groups with files and meaningful commit messages.
+    """
+    operations = summarize_file_operations(staged_files)
+
+    if operations:
+        return operations
+
+    # Ultimate fallback: single commit with all files
+    return [{
+        "files": list(staged_files.keys()),
+        "message": "chore: update files",
+        "description": f"{len(staged_files)} files changed"
+    }]
 
 
 def call_llm_two_phase(config, staged_files):
@@ -849,12 +1124,12 @@ def call_llm_two_phase(config, staged_files):
         groups = groups.get("groups", groups.get("commits", []))
 
     if not isinstance(groups, list):
-        warn(f"phase1 returned non-list ({type(groups).__name__}), falling back to single commit")
-        groups = []
+        warn(f"phase1 returned non-list ({type(groups).__name__}), using smart grouping")
+        groups = group_files_by_directory(staged_files)
 
     if not groups:
-        # Fallback: put all files in one group
-        groups = [{"files": list(staged_files.keys()), "hint": "all changes"}]
+        # Use smart grouping as fallback
+        groups = group_files_by_directory(staged_files)
 
     commits = []
     for i, group in enumerate(groups):
@@ -862,6 +1137,17 @@ def call_llm_two_phase(config, staged_files):
             continue
         files = group.get("files", [])
         if not files:
+            continue
+
+        # If group already has a message (from smart grouping), use it directly
+        if group.get("message"):
+            normalized = normalize_llm_files(files, staged_files) if isinstance(files[0], str) else files
+            if normalized:
+                commits.append({
+                    "files": normalized,
+                    "message": group["message"],
+                    "description": group.get("description", ""),
+                })
             continue
 
         # Normalize files to actual staged paths
@@ -879,21 +1165,53 @@ def call_llm_two_phase(config, staged_files):
         try:
             result = call_llm_raw(config, PHASE2_PROMPT, content)
         except ContextLengthExceeded:
-            warn(f"context length exceeded for group {i + 1}, using fallback message")
-            hint = group.get("hint", "update files")
-            commits.append({"files": normalized, "message": f"chore: {hint}", "description": ""})
+            warn(f"context length exceeded for group {i + 1}, using smart analysis")
+            # Build staged_files subset for this group and analyze
+            group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
+            smart_ops = summarize_file_operations(group_staged)
+            if smart_ops:
+                for op in smart_ops:
+                    commits.append({
+                        "files": op["files"],
+                        "message": op["message"],
+                        "description": op.get("description", ""),
+                    })
+            else:
+                # Ultimate fallback: describe based on operation type
+                sample = staged_files.get(normalized[0], {})
+                if sample.get("deleted"):
+                    msg = f"chore: remove {len(normalized)} files"
+                elif sample.get("old") != normalized[0]:
+                    msg = f"refactor: rename {len(normalized)} files"
+                else:
+                    msg = f"chore: update {len(normalized)} files"
+                commits.append({"files": normalized, "message": msg, "description": ""})
             continue
 
         # Handle various response formats - extract dict from list if needed
         if isinstance(result, list) and len(result) > 0:
             result = result[0]
         if not isinstance(result, dict):
-            warn(f"phase2 returned non-dict for group {i + 1}, skipping")
+            warn(f"phase2 returned non-dict for group {i + 1}, using smart analysis")
+            group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
+            smart_ops = summarize_file_operations(group_staged)
+            if smart_ops:
+                for op in smart_ops:
+                    commits.append({"files": op["files"], "message": op["message"], "description": op.get("description", "")})
             continue
+
         message = result.get("message")
         if not message or message.lower() in ("message", ""):
-            warn(f"phase2 missing message for group {i + 1}, using fallback")
-            message = "chore: update files"
+            warn(f"phase2 missing message for group {i + 1}, using smart analysis")
+            group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
+            smart_ops = summarize_file_operations(group_staged)
+            if smart_ops:
+                for op in smart_ops:
+                    commits.append({"files": op["files"], "message": op["message"], "description": op.get("description", "")})
+                continue
+            # If smart analysis also fails, describe based on file count
+            message = f"chore: update {len(normalized)} files"
+
         description = result.get("description", "")
         if description.lower() in ("description", "desc"):
             description = ""
@@ -914,7 +1232,7 @@ def main():
     parser.add_argument("--no-verify", action="store_true", help="bypass pre-commit hooks")
     parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
     parser.add_argument("--no-push", action="store_true", help="skip automatic push")
-    parser.add_argument("--bulk", action="store_true", help="skip LLM and group by directory (for large batches)")
+    parser.add_argument("--bulk", action="store_true", help="skip LLM, use smart file tree analysis (for large batches)")
     args = parser.parse_args()
 
     log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk})
@@ -940,31 +1258,18 @@ def main():
 
     print(f"analysing {source} changes ({file_count} files)...")
 
-    # For very large file counts or explicit --bulk flag, skip LLM entirely
+    # For very large file counts or explicit --bulk flag, use smart file tree analysis
     if args.bulk or file_count > BULK_FILE_THRESHOLD:
         if args.bulk:
-            print("  using bulk mode (--bulk flag)")
+            print("  using smart bulk mode (--bulk flag)")
             log("INFO", "using bulk mode (--bulk flag)", {"file_count": file_count})
         else:
-            warn(f"file count ({file_count}) exceeds bulk threshold ({BULK_FILE_THRESHOLD}), using directory grouping")
+            print(f"  large changeset ({file_count} files), using smart bulk mode")
             log("INFO", "using bulk mode (auto)", {"file_count": file_count})
-        groups = group_files_by_directory(staged_files)
-        # Generate simple commit messages based on directory groups
-        commits = []
-        for group in groups:
-            files = group["files"]
-            hint = group.get("hint", "update files")
-            # Simple message based on operation type
-            sample_info = staged_files.get(files[0], {})
-            if sample_info.get("deleted"):
-                msg = f"chore: remove {hint.replace('changes in ', '')}"
-            else:
-                msg = f"chore: {hint}"
-            commits.append({
-                "files": files,
-                "message": msg,
-                "description": "",
-            })
+
+        # Use smart file tree analysis to detect directory-level operations
+        commits = group_files_by_directory(staged_files)
+        print(f"  detected {len(commits)} logical operations")
     elif file_count > LARGE_DIFF_FILES:
         print("  using two-phase approach for large diff")
         commits = call_llm_two_phase(config, staged_files)
