@@ -49,6 +49,9 @@ def log(level, message, context=None):
         f.write(line + "\n")
 
 
+MAX_STATUS_LINES_IN_LOG = 100
+
+
 def log_git_state():
     """Log current git state to session log."""
     try:
@@ -66,7 +69,12 @@ def log_git_state():
         if status_result.returncode == 0:
             status = status_result.stdout.decode().strip()
             if status:
-                log("INFO", f"git status:\n{status}")
+                lines = status.splitlines()
+                if len(lines) > MAX_STATUS_LINES_IN_LOG:
+                    truncated = "\n".join(lines[:MAX_STATUS_LINES_IN_LOG])
+                    log("INFO", f"git status (truncated, {len(lines)} files total):\n{truncated}\n... and {len(lines) - MAX_STATUS_LINES_IN_LOG} more")
+                else:
+                    log("INFO", f"git status:\n{status}")
     except Exception as e:
         log("INFO", f"failed to capture git state: {e}")
 
@@ -272,6 +280,10 @@ MAX_LINES_PER_HUNK = 15
 MAX_HUNKS_PER_FILE = 5
 LARGE_DIFF_FILES = 15
 MAX_OUTPUT_TOKENS = 4096
+# Beyond this many files, skip LLM entirely and use bulk commit
+BULK_FILE_THRESHOLD = 200
+# Maximum characters for phase 1 file summary before fallback
+MAX_PHASE1_CHARS = 50000
 
 
 def parse_files_from_diff(diff):
@@ -521,6 +533,11 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 
 
+class ContextLengthExceeded(Exception):
+    """Raised when LLM context length is exceeded."""
+    pass
+
+
 def try_repair_json(content):
     """Attempt to repair truncated or malformed JSON arrays/objects.
 
@@ -529,6 +546,7 @@ def try_repair_json(content):
     - Trailing garbage: }]...  or }]```
     - Truncated mid-string: [..., "file  -> close string and array
     - Truncated mid-object: [..., {"files": ["a"]  -> close object and array
+    - Object instead of array: {"files": [...]} when we expected [{...}]
     """
     content = content.strip()
 
@@ -566,6 +584,8 @@ def try_repair_json(content):
         '}]',       # truncated mid-object in array
         ']',        # truncated array
         '}',        # truncated object
+        '"]}',      # truncated mid-string in array inside object (phase1 {"files": ["a", "b)
+        '"],"hint":""}]',  # phase1 truncated with hint missing
     ]
 
     for repair in repairs:
@@ -578,12 +598,12 @@ def try_repair_json(content):
 
     # Try removing the last incomplete element
     # Find the last complete element (ends with }, or ])
-    for end_char in ['},', '],', '}', ']']:
+    for end_char in ['},', '],', '}', ']', '",']:
         idx = content.rfind(end_char)
         if idx > 0:
             truncated = content[:idx + len(end_char)]
             # Add closing brackets as needed
-            for close in [']', ']}', '}]', ']}]']:
+            for close in [']', ']}', '}]', ']}]', '"]}', '"],"hint":""}]']:
                 try:
                     result = json.loads(truncated + close)
                     print(f"  repaired truncated JSON by removing incomplete element")
@@ -626,6 +646,10 @@ def call_llm_raw(config, system_prompt, user_content):
             )
             if resp.status_code == 200:
                 break
+            if resp.status_code == 400 and "context length" in resp.text.lower():
+                # Context length exceeded - signal caller to use fallback
+                log("INFO", "LLM context length exceeded", {"response": resp.text[:300]})
+                raise ContextLengthExceeded(resp.text[:500])
             if resp.status_code in RETRYABLE_STATUS_CODES:
                 last_error = f"API returned {resp.status_code}: {resp.text[:200]}"
                 if attempt < MAX_RETRIES - 1:
@@ -769,6 +793,31 @@ def call_llm(config, diff):
     return result
 
 
+def group_files_by_directory(staged_files):
+    """Group files by their top-level directory for bulk commits.
+
+    Returns list of groups with files and auto-generated hints.
+    """
+    from collections import defaultdict
+    dir_groups = defaultdict(list)
+
+    for path in staged_files.keys():
+        parts = path.split("/")
+        if len(parts) > 1:
+            top_dir = parts[0]
+        else:
+            top_dir = "root"
+        dir_groups[top_dir].append(path)
+
+    groups = []
+    for dir_name, files in sorted(dir_groups.items()):
+        groups.append({
+            "files": files,
+            "hint": f"changes in {dir_name}/"
+        })
+    return groups
+
+
 def call_llm_two_phase(config, staged_files):
     """Two-phase approach for large diffs with many files.
 
@@ -780,10 +829,20 @@ def call_llm_two_phase(config, staged_files):
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
 
     phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
-    log("INFO", "phase 1: sending file summary to LLM", {"chars": len(phase1_content)})
-    print("  phase 1: grouping files...")
 
-    groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
+    # Check if phase1 content is too large for the LLM
+    if len(phase1_content) > MAX_PHASE1_CHARS:
+        warn(f"file summary too large ({len(phase1_content)} chars), grouping by directory instead")
+        log("INFO", "skipping LLM phase 1 due to size", {"chars": len(phase1_content)})
+        groups = group_files_by_directory(staged_files)
+    else:
+        log("INFO", "phase 1: sending file summary to LLM", {"chars": len(phase1_content)})
+        print("  phase 1: grouping files...")
+        try:
+            groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
+        except ContextLengthExceeded:
+            warn("LLM context length exceeded, falling back to directory grouping")
+            groups = group_files_by_directory(staged_files)
 
     # Handle case where LLM returns a dict with "groups" key instead of array
     if isinstance(groups, dict):
@@ -816,7 +875,14 @@ def call_llm_two_phase(config, staged_files):
             continue
         content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
         log("INFO", f"phase 2 group {i + 1}: sending diff to LLM", {"chars": len(content), "files": len(normalized)})
-        result = call_llm_raw(config, PHASE2_PROMPT, content)
+
+        try:
+            result = call_llm_raw(config, PHASE2_PROMPT, content)
+        except ContextLengthExceeded:
+            warn(f"context length exceeded for group {i + 1}, using fallback message")
+            hint = group.get("hint", "update files")
+            commits.append({"files": normalized, "message": f"chore: {hint}", "description": ""})
+            continue
 
         # Handle various response formats - extract dict from list if needed
         if isinstance(result, list) and len(result) > 0:
@@ -848,9 +914,10 @@ def main():
     parser.add_argument("--no-verify", action="store_true", help="bypass pre-commit hooks")
     parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
     parser.add_argument("--no-push", action="store_true", help="skip automatic push")
+    parser.add_argument("--bulk", action="store_true", help="skip LLM and group by directory (for large batches)")
     args = parser.parse_args()
 
-    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push})
+    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk})
     log_git_state()
 
     config = load_config()
@@ -872,12 +939,39 @@ def main():
     lockfiles = get_lockfiles_in_staging() if source == "all" else []
 
     print(f"analysing {source} changes ({file_count} files)...")
-    if file_count > LARGE_DIFF_FILES:
+
+    # For very large file counts or explicit --bulk flag, skip LLM entirely
+    if args.bulk or file_count > BULK_FILE_THRESHOLD:
+        if args.bulk:
+            print("  using bulk mode (--bulk flag)")
+            log("INFO", "using bulk mode (--bulk flag)", {"file_count": file_count})
+        else:
+            warn(f"file count ({file_count}) exceeds bulk threshold ({BULK_FILE_THRESHOLD}), using directory grouping")
+            log("INFO", "using bulk mode (auto)", {"file_count": file_count})
+        groups = group_files_by_directory(staged_files)
+        # Generate simple commit messages based on directory groups
+        commits = []
+        for group in groups:
+            files = group["files"]
+            hint = group.get("hint", "update files")
+            # Simple message based on operation type
+            sample_info = staged_files.get(files[0], {})
+            if sample_info.get("deleted"):
+                msg = f"chore: remove {hint.replace('changes in ', '')}"
+            else:
+                msg = f"chore: {hint}"
+            commits.append({
+                "files": files,
+                "message": msg,
+                "description": "",
+            })
+    elif file_count > LARGE_DIFF_FILES:
         print("  using two-phase approach for large diff")
         commits = call_llm_two_phase(config, staged_files)
+        commits = validate_and_fix_commits(commits, staged_files)
     else:
         commits = call_llm(config, diff)
-    commits = validate_and_fix_commits(commits, staged_files)
+        commits = validate_and_fix_commits(commits, staged_files)
 
     if not commits:
         exit_with_error("no valid commits generated", {"file_count": file_count})
