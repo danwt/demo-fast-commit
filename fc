@@ -714,6 +714,11 @@ def call_llm_raw(config, system_prompt, user_content):
     if finish_reason == "length":
         warn("LLM response was truncated due to length limit")
 
+    # Handle empty response - return empty list to trigger fallback/retry logic
+    if not content:
+        record_error("LLM returned empty response", {"model": config["MODEL"]})
+        return []
+
     # Try normal parse first
     try:
         return json.loads(content)
@@ -725,10 +730,12 @@ def call_llm_raw(config, system_prompt, user_content):
     if repaired is not None:
         return repaired
 
-    exit_with_error(
+    # Return empty list instead of exiting - allows caller to fall back gracefully
+    record_error(
         "LLM returned unparseable JSON",
         {"content": content[:1000], "model": config["MODEL"]}
     )
+    return []
 
 
 RETRY_PROMPT = """You MUST output REAL file paths and REAL commit messages.
@@ -1208,11 +1215,13 @@ def main():
         message = commit["message"]
         description = commit.get("description", "")
 
-        # Stage files - use git rm for deleted files, git add for others
+        # Stage files - use git rm --cached for deleted files (file doesn't exist on disk),
+        # git add for others
         added_files = []
         for f in files:
             if is_file_deleted(f, staged_files):
-                _, stderr, code = run(["git", "rm", "--", f])
+                # Use --cached since file is already deleted from working tree
+                _, stderr, code = run(["git", "rm", "--cached", "--", f])
             else:
                 _, stderr, code = run(["git", "add", "--", f])
             if code == 0:
