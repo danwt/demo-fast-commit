@@ -16,37 +16,48 @@ from datetime import datetime
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
-ERRORS_DIR = Path.home() / ".fastc" / "errors"
+LOGS_DIR = Path.home() / ".fastc" / "logs"
+
+# Session log file - created once per run
+_session_log = None
 
 
-def record_error(message, context=None):
-    """Record error details to disk for debugging.
+def get_session_log():
+    """Get or create session log file for this execution."""
+    global _session_log
+    if _session_log is None:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _session_log = LOGS_DIR / f"session_{timestamp}.log"
+        # Write header
+        _session_log.write_text(f"=== fastc session started: {datetime.now().isoformat()} ===\n")
+    return _session_log
 
-    Creates timestamped error files in the errors/ directory with:
-    - Error message
-    - Timestamp
-    - Git state (branch, status)
-    - Optional context dict
-    - Stack trace
+
+def log(level, message, context=None):
+    """Log a message to the session log file.
+
+    Levels: INFO, WARN, ERROR
     """
-    ERRORS_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    error_file = ERRORS_DIR / f"error_{timestamp}.txt"
+    log_file = get_session_log()
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    line = f"[{timestamp}] {level}: {message}"
+    if context:
+        context_str = ", ".join(f"{k}={v}" for k, v in context.items())
+        line += f" | {context_str}"
+    with open(log_file, "a") as f:
+        f.write(line + "\n")
 
-    lines = [
-        f"timestamp: {datetime.now().isoformat()}",
-        f"error: {message}",
-        "",
-    ]
 
-    # Capture git state
+def log_git_state():
+    """Log current git state to session log."""
     try:
         branch_result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, timeout=5
         )
         branch = branch_result.stdout.decode().strip() if branch_result.returncode == 0 else "unknown"
-        lines.append(f"git_branch: {branch}")
+        log("INFO", f"git branch: {branch}")
 
         status_result = subprocess.run(
             ["git", "status", "--short"],
@@ -54,25 +65,33 @@ def record_error(message, context=None):
         )
         if status_result.returncode == 0:
             status = status_result.stdout.decode().strip()
-            lines.append(f"git_status:\n{status}")
-    except Exception:
-        lines.append("git_state: failed to capture")
+            if status:
+                log("INFO", f"git status:\n{status}")
+    except Exception as e:
+        log("WARN", f"failed to capture git state: {e}")
 
-    lines.append("")
 
-    # Add context if provided
-    if context:
-        lines.append("context:")
-        for key, value in context.items():
-            lines.append(f"  {key}: {value}")
-        lines.append("")
+def warn(message, context=None):
+    """Print warning to user and log it."""
+    print(f"  warning: {message}", file=sys.stderr)
+    log("WARN", message, context)
 
-    # Add stack trace
-    lines.append("stack_trace:")
-    lines.append(traceback.format_exc())
 
-    error_file.write_text("\n".join(lines))
-    print(f"  error recorded: {error_file}", file=sys.stderr)
+def record_error(message, context=None):
+    """Record error details to session log with full context."""
+    log("ERROR", message, context)
+
+    # Also add stack trace if we're in an exception handler
+    exc_info = traceback.format_exc()
+    if exc_info and exc_info.strip() != "NoneType: None":
+        log_file = get_session_log()
+        with open(log_file, "a") as f:
+            f.write(f"Stack trace:\n{exc_info}\n")
+
+    # Log git state for context
+    log_git_state()
+
+    print(f"  session log: {get_session_log()}", file=sys.stderr)
 
 
 def exit_with_error(message, context=None):
@@ -390,15 +409,15 @@ def validate_and_fix_commits(commits, staged_files):
 
     for commit in commits:
         if not isinstance(commit, dict):
-            print(f"  warning: skipping non-dict commit: {commit}", file=sys.stderr)
+            warn(f"skipping non-dict commit: {commit}")
             continue
         if "files" not in commit or "message" not in commit:
-            print(f"  warning: skipping malformed commit: {commit}", file=sys.stderr)
+            warn(f"skipping malformed commit: {commit}")
             continue
 
         normalized = normalize_llm_files(commit["files"], staged_files)
         if not normalized:
-            print(f"  warning: skipping commit with no valid files: {commit.get('message', '<missing>')}", file=sys.stderr)
+            warn(f"skipping commit with no valid files: {commit.get('message', '<missing>')}")
             continue
 
         covered_files.update(normalized)
@@ -412,11 +431,11 @@ def validate_and_fix_commits(commits, staged_files):
     if missing_files:
         # Add missing files to the last commit or create a new one
         if fixed_commits:
-            print(f"  warning: LLM missed {len(missing_files)} files, adding to last commit", file=sys.stderr)
+            warn(f"LLM missed {len(missing_files)} files, adding to last commit", {"files": list(missing_files)[:5]})
             fixed_commits[-1]["files"].extend(list(missing_files))
         else:
             # No valid commits at all - create a fallback single commit
-            print(f"  warning: LLM failed to group files, creating single commit", file=sys.stderr)
+            warn("LLM failed to group files, creating single commit")
             fixed_commits.append({
                 "files": list(all_staged),
                 "message": "chore: update files",
@@ -611,7 +630,7 @@ def call_llm_raw(config, system_prompt, user_content):
                 last_error = f"API returned {resp.status_code}: {resp.text[:200]}"
                 if attempt < MAX_RETRIES - 1:
                     wait_time = 2**attempt
-                    print(f"  retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                    warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     time.sleep(wait_time)
                     continue
             exit_with_error(
@@ -622,7 +641,7 @@ def call_llm_raw(config, system_prompt, user_content):
             last_error = "request timed out"
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2**attempt
-                print(f"  request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                warn(f"LLM request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
                 time.sleep(wait_time)
                 continue
             exit_with_error(
@@ -633,7 +652,7 @@ def call_llm_raw(config, system_prompt, user_content):
             last_error = str(e)
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2**attempt
-                print(f"  request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})...", file=sys.stderr)
+                warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
                 time.sleep(wait_time)
                 continue
             exit_with_error(
@@ -669,7 +688,7 @@ def call_llm_raw(config, system_prompt, user_content):
     # Check if response was truncated (finish_reason)
     finish_reason = resp_json.get("choices", [{}])[0].get("finish_reason", "")
     if finish_reason == "length":
-        print("  warning: LLM response was truncated due to length limit")
+        warn("LLM response was truncated due to length limit")
 
     # Try normal parse first
     try:
@@ -735,13 +754,16 @@ def normalize_llm_result(result):
 def call_llm(config, diff):
     """Single-phase: send diff and get commits."""
     content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
+    log("INFO", f"sending diff to LLM", {"chars": len(content), "compressed": len(diff) > MAX_DIFF_CHARS})
     result = call_llm_raw(config, SYSTEM_PROMPT, content)
     result = normalize_llm_result(result)
 
     # Retry with stronger prompt if response looks malformed
     if is_malformed_response(result):
-        print("  response looks malformed, retrying with stronger prompt...")
-        result = call_llm_raw(config, RETRY_PROMPT, content[:5000])
+        warn("response looks malformed, retrying with stronger prompt")
+        # Use compressed version for retry to save tokens
+        retry_content = compress_diff(diff) if len(diff) > MAX_DIFF_CHARS // 2 else content
+        result = call_llm_raw(config, RETRY_PROMPT, retry_content)
         result = normalize_llm_result(result)
 
     return result
@@ -758,6 +780,7 @@ def call_llm_two_phase(config, staged_files):
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
 
     phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
+    log("INFO", "phase 1: sending file summary to LLM", {"chars": len(phase1_content)})
     print("  phase 1: grouping files...")
 
     groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
@@ -767,7 +790,7 @@ def call_llm_two_phase(config, staged_files):
         groups = groups.get("groups", groups.get("commits", []))
 
     if not isinstance(groups, list):
-        print(f"  warning: phase1 returned non-list ({type(groups).__name__}), falling back to single commit", file=sys.stderr)
+        warn(f"phase1 returned non-list ({type(groups).__name__}), falling back to single commit")
         groups = []
 
     if not groups:
@@ -792,17 +815,18 @@ def call_llm_two_phase(config, staged_files):
         if not group_diff.strip():
             continue
         content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
+        log("INFO", f"phase 2 group {i + 1}: sending diff to LLM", {"chars": len(content), "files": len(normalized)})
         result = call_llm_raw(config, PHASE2_PROMPT, content)
 
         # Handle various response formats - extract dict from list if needed
         if isinstance(result, list) and len(result) > 0:
             result = result[0]
         if not isinstance(result, dict):
-            print(f"  warning: phase2 returned non-dict for group {i + 1}, skipping", file=sys.stderr)
+            warn(f"phase2 returned non-dict for group {i + 1}, skipping")
             continue
         message = result.get("message")
         if not message or message.lower() in ("message", ""):
-            print(f"  warning: phase2 missing message for group {i + 1}, using fallback", file=sys.stderr)
+            warn(f"phase2 missing message for group {i + 1}, using fallback")
             message = "chore: update files"
         description = result.get("description", "")
         if description.lower() in ("description", "desc"):
@@ -826,7 +850,11 @@ def main():
     parser.add_argument("--no-push", action="store_true", help="skip automatic push")
     args = parser.parse_args()
 
+    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push})
+    log_git_state()
+
     config = load_config()
+    log("INFO", f"using model: {config['MODEL']}")
 
     diff, source = get_diff()
     if not diff:
@@ -890,7 +918,7 @@ def main():
             if code == 0:
                 added_files.append(f)
             else:
-                print(f"  warning: could not stage {f}: {stderr.strip()}", file=sys.stderr)
+                warn(f"could not stage {f}: {stderr.strip()}")
 
         if not added_files:
             print(f"  skipping commit (no files staged): {message}")
@@ -902,10 +930,17 @@ def main():
             commit_cmd += ["-m", description]
         _, stderr, code = run(commit_cmd)
         if code != 0:
+            # Detect hook failures
+            if "hook" in stderr.lower() or "pre-commit" in stderr.lower():
+                exit_with_error(
+                    f"commit blocked by git hook. Fix the issues or use --no-verify to bypass",
+                    {"message": message, "files": added_files, "stderr": stderr}
+                )
             exit_with_error(
                 f"commit failed: {stderr}",
                 {"message": message, "files": added_files, "stderr": stderr}
             )
+        log("INFO", f"committed: {message}", {"files": len(added_files)})
         print(f"  {message}")
 
     # Commit lockfiles separately with a simple message
@@ -916,19 +951,39 @@ def main():
         if staged_check.strip():
             _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
             if code != 0:
+                if "hook" in stderr.lower():
+                    exit_with_error(
+                        f"lockfile commit blocked by git hook. Use --no-verify to bypass",
+                        {"lockfiles": lockfiles, "stderr": stderr}
+                    )
                 exit_with_error(
                     f"lockfile commit failed: {stderr}",
                     {"lockfiles": lockfiles, "stderr": stderr}
                 )
+            log("INFO", "committed lockfiles", {"count": len(lockfiles)})
             print("  chore: update lockfiles")
 
     if args.no_push:
+        log("INFO", "session completed (push skipped)")
         print("done (push skipped)")
         return
 
     _, stderr, code = run(["git", "push"])
     if code != 0:
+        # Detect out-of-sync (rejected push)
+        if "rejected" in stderr.lower() or "non-fast-forward" in stderr.lower():
+            exit_with_error(
+                "push rejected: remote has changes. Run 'git pull' first to sync",
+                {"stderr": stderr}
+            )
+        if "no upstream" in stderr.lower() or "no configured push destination" in stderr.lower():
+            exit_with_error(
+                "push failed: no upstream branch. Run 'git push -u origin <branch>' first",
+                {"stderr": stderr}
+            )
         exit_with_error("push failed", {"stderr": stderr})
+    log("INFO", "pushed to remote")
+    log("INFO", "session completed successfully")
     print("pushed")
 
 
