@@ -101,11 +101,11 @@ These files are excluded from LLM analysis (but still committed):
 
 ## Claude Code integration
 
-Copy [`SKILL.md`](SKILL.md) to your `.claude/skills/` directory:
+Copy [`SKILL.md`](SKILL.md) to your `.claude/skills/fastc/` directory:
 
 ```bash
-mkdir -p ~/.claude/skills
-cp SKILL.md ~/.claude/skills/fastc.md
+mkdir -p ~/.claude/skills/fastc
+cp SKILL.md ~/.claude/skills/fastc/SKILL.md
 ```
 
 Then invoke with `/fastc` in Claude Code.
