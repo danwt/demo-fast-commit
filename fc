@@ -17,6 +17,7 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "fast-commit" / ".env"
 LOGS_DIR = Path.home() / ".fastc" / "logs"
+AUDIT_LOG = Path.home() / ".fastc" / "audit.jsonl"
 
 # Session log file - created once per run
 _session_log = None
@@ -102,10 +103,40 @@ def record_error(message, context=None):
     print(f"  session log: {get_session_log()}", file=sys.stderr)
 
 
+_audit_repo = None
+
+
+def audit(event, data=None):
+    """Append a structured entry to the persistent audit log.
+
+    The audit log is a JSONL file (~/.fastc/audit.jsonl) that accumulates
+    across all runs. Each line is a JSON object with timestamp, repo, event
+    type, and event-specific data.
+    """
+    global _audit_repo
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    if _audit_repo is None:
+        repo_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, timeout=5,
+        )
+        _audit_repo = repo_result.stdout.decode().strip() if repo_result.returncode == 0 else "unknown"
+    entry = {
+        "ts": datetime.now().isoformat(),
+        "repo": _audit_repo,
+        "event": event,
+    }
+    if data:
+        entry["data"] = data
+    with open(AUDIT_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 def exit_with_error(message, context=None):
     """Print error, record to disk, and exit."""
     print(f"error: {message}", file=sys.stderr)
     record_error(message, context)
+    audit("error", {"message": message})
     sys.exit(1)
 
 # Files to exclude from diff analysis (don't help with commit messages)
@@ -1164,6 +1195,13 @@ def main():
     # Check for lockfiles before we reset staging (must happen before reset)
     lockfiles = get_lockfiles_in_staging() if source == "all" else []
 
+    audit("start", {
+        "source": source,
+        "file_count": file_count,
+        "files": sorted(staged_files.keys()),
+        "lockfiles": lockfiles,
+    })
+
     print(f"analysing {source} changes ({file_count} files)...")
 
     # For very large file counts or explicit --bulk flag, use smart file tree analysis
@@ -1201,6 +1239,7 @@ def main():
             print(f"  chore: update lockfiles")
             for f in lockfiles:
                 print(f"    - {f}")
+        audit("dry_run", {"commits": len(commits)})
         return
 
     if source == "all":
@@ -1229,8 +1268,13 @@ def main():
             else:
                 warn(f"could not stage {f}: {stderr.strip()}")
 
+        skipped_files = [f for f in files if f not in added_files]
+        if skipped_files:
+            audit("stage_skip", {"message": message, "skipped": skipped_files})
+
         if not added_files:
             print(f"  skipping commit (no files staged): {message}")
+            audit("commit_skip", {"message": message, "files": files})
             continue
 
         # Use two -m flags: first for subject, second for body
@@ -1239,6 +1283,7 @@ def main():
             commit_cmd += ["-m", description]
         _, stderr, code = run(commit_cmd)
         if code != 0:
+            audit("commit_fail", {"message": message, "files": added_files, "stderr": stderr.strip()})
             # Detect hook failures
             if "hook" in stderr.lower() or "pre-commit" in stderr.lower():
                 exit_with_error(
@@ -1249,6 +1294,7 @@ def main():
                 f"commit failed: {stderr}",
                 {"message": message, "files": added_files, "stderr": stderr}
             )
+        audit("commit_ok", {"message": message, "files": added_files})
         log("INFO", f"committed: {message}", {"files": len(added_files)})
         print(f"  {message}")
 
@@ -1271,6 +1317,21 @@ def main():
                 )
             log("INFO", "committed lockfiles", {"count": len(lockfiles)})
             print("  chore: update lockfiles")
+
+    # Audit: check for remaining uncommitted changes
+    remaining_staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
+    remaining_unstaged, _, _ = run(["git", "diff", "--name-only"])
+    remaining_untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
+    remaining = {
+        "staged": [f for f in remaining_staged.strip().splitlines() if f],
+        "unstaged": [f for f in remaining_unstaged.strip().splitlines() if f],
+        "untracked": [f for f in remaining_untracked.strip().splitlines() if f],
+    }
+    has_remaining = any(remaining.values())
+    audit("finish", {"remaining": remaining, "clean": not has_remaining})
+    if has_remaining:
+        total = sum(len(v) for v in remaining.values())
+        warn(f"{total} files still uncommitted after run (check ~/.fastc/audit.jsonl)")
 
     if args.no_push:
         log("INFO", "session completed (push skipped)")
