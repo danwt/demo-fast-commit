@@ -1254,15 +1254,19 @@ def main():
         message = commit["message"]
         description = commit.get("description", "")
 
-        # Stage files - use git rm --cached for deleted files (file doesn't exist on disk),
-        # git add for others
+        # Stage files: git rm for deletes, git add for adds/modifies,
+        # and for renames also rm the old path from the index
         added_files = []
         for f in files:
             if is_file_deleted(f, staged_files):
-                # Use --cached since file is already deleted from working tree
                 _, stderr, code = run(["git", "rm", "--cached", "--", f])
             else:
                 _, stderr, code = run(["git", "add", "--", f])
+                # For renames: also remove the old path from the index
+                info = staged_files.get(f, {})
+                old_path = info.get("old", f)
+                if code == 0 and old_path != f:
+                    run(["git", "rm", "--cached", "--", old_path])
             if code == 0:
                 added_files.append(f)
             else:
