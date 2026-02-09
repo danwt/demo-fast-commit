@@ -292,7 +292,10 @@ def get_diff():
     staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     if staged.strip():
         diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
-        return strip_diff_noise(diff), "staged"
+        diff = strip_diff_noise(diff)
+        if diff:
+            return diff, "staged"
+        # Staged files were all lockfiles/excluded — fall through to check unstaged
     diff, _, _ = run(["git", "diff", "--minimal"])
     if not diff.strip():
         untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
