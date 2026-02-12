@@ -346,6 +346,44 @@ def is_lockfile(path):
     return False
 
 
+def git_unquote(path):
+    """Decode git's C-style quoted path.
+
+    Git quotes paths with non-ASCII or special chars using octal escapes:
+    "path/Age of Empires\\357\\274\\232 stuff" -> path/Age of Empires： stuff
+    """
+    if not (path.startswith('"') and path.endswith('"')):
+        return path
+    inner = path[1:-1]
+    result = bytearray()
+    i = 0
+    while i < len(inner):
+        if inner[i] == '\\' and i + 1 < len(inner):
+            c = inner[i + 1]
+            if c in '01234567' and i + 3 < len(inner):
+                result.append(int(inner[i + 1:i + 4], 8))
+                i += 4
+            elif c == '\\':
+                result.append(ord('\\'))
+                i += 2
+            elif c == '"':
+                result.append(ord('"'))
+                i += 2
+            elif c == 'n':
+                result.append(ord('\n'))
+                i += 2
+            elif c == 't':
+                result.append(ord('\t'))
+                i += 2
+            else:
+                result.extend(inner[i].encode('utf-8'))
+                i += 1
+        else:
+            result.extend(inner[i].encode('utf-8'))
+            i += 1
+    return result.decode('utf-8')
+
+
 def get_staged_files_for_commit():
     """Get actual staged files that can be committed (excluding lockfiles).
 
@@ -361,16 +399,18 @@ def get_staged_files_for_commit():
         parts = line.split("\t")
         status = parts[0]
         if status.startswith("R"):  # Rename: R100\told\tnew
-            old_path = parts[1]
-            new_path = parts[2]
+            old_path = git_unquote(parts[1])
+            new_path = git_unquote(parts[2])
             if not is_lockfile(new_path):
                 files[new_path] = {"old": old_path, "deleted": False}
         elif status == "D":  # Deleted
-            if not is_lockfile(parts[1]):
-                files[parts[1]] = {"old": parts[1], "deleted": True}
+            path = git_unquote(parts[1])
+            if not is_lockfile(path):
+                files[path] = {"old": path, "deleted": True}
         else:  # Added, Modified, etc
-            if not is_lockfile(parts[1]):
-                files[parts[1]] = {"old": parts[1], "deleted": False}
+            path = git_unquote(parts[1])
+            if not is_lockfile(path):
+                files[path] = {"old": path, "deleted": False}
     return files
 
 
@@ -1166,7 +1206,7 @@ def call_llm_two_phase(config, staged_files):
 def get_lockfiles_in_staging():
     """Get list of lockfiles that are staged."""
     staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
-    return [f for f in staged.strip().splitlines() if f and is_lockfile(f)]
+    return [git_unquote(f) for f in staged.strip().splitlines() if f and is_lockfile(git_unquote(f))]
 
 
 def main():
@@ -1330,9 +1370,9 @@ def main():
     remaining_unstaged, _, _ = run(["git", "diff", "--name-only"])
     remaining_untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
     remaining = {
-        "staged": [f for f in remaining_staged.strip().splitlines() if f],
-        "unstaged": [f for f in remaining_unstaged.strip().splitlines() if f],
-        "untracked": [f for f in remaining_untracked.strip().splitlines() if f],
+        "staged": [git_unquote(f) for f in remaining_staged.strip().splitlines() if f],
+        "unstaged": [git_unquote(f) for f in remaining_unstaged.strip().splitlines() if f],
+        "untracked": [git_unquote(f) for f in remaining_untracked.strip().splitlines() if f],
     }
     has_remaining = any(remaining.values())
     audit("finish", {"remaining": remaining, "clean": not has_remaining})
