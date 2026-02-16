@@ -1236,7 +1236,7 @@ def main():
         return
 
     # Check for lockfiles before we reset staging (must happen before reset)
-    lockfiles = get_lockfiles_in_staging() if source == "all" else []
+    lockfiles = get_lockfiles_in_staging()
 
     audit("start", {
         "source": source,
@@ -1285,12 +1285,17 @@ def main():
         audit("dry_run", {"commits": len(commits)})
         return
 
-    if source == "all":
-        run(["git", "reset", "HEAD"], check=True)
+    # Always reset index before commit loop so each commit only includes
+    # files explicitly staged for it. Without this, pre-staged files leak
+    # into the first commit (all staged files get committed, not just the
+    # intended subset).
+    run(["git", "reset", "HEAD"], check=True)
 
     commit_args = ["git", "commit"]
     if args.no_verify:
         commit_args.append("--no-verify")
+
+    failed_commits = []
 
     for commit in commits:
         files = commit["files"]
@@ -1324,23 +1329,33 @@ def main():
             audit("commit_skip", {"message": message, "files": files})
             continue
 
+        # Verify something is actually staged before committing
+        staged_check, _, _ = run(["git", "diff", "--cached", "--name-only"])
+        if not staged_check.strip():
+            warn(f"nothing staged after git add, skipping: {message}")
+            audit("commit_skip", {"message": message, "files": added_files, "reason": "nothing_staged"})
+            continue
+
         # Use two -m flags: first for subject, second for body
         commit_cmd = commit_args + ["-m", message]
         if description:
             commit_cmd += ["-m", description]
-        _, stderr, code = run(commit_cmd)
+        stdout, stderr, code = run(commit_cmd)
         if code != 0:
-            audit("commit_fail", {"message": message, "files": added_files, "stderr": stderr.strip()})
-            # Detect hook failures
+            # git puts "nothing to commit" on stdout, not stderr
+            error_detail = stderr.strip() or stdout.strip()
+            audit("commit_fail", {"message": message, "files": added_files, "stderr": stderr.strip(), "stdout": stdout.strip()})
+            # Detect hook failures — these are fatal
             if "hook" in stderr.lower() or "pre-commit" in stderr.lower():
                 exit_with_error(
                     f"commit blocked by git hook. Fix the issues or use --no-verify to bypass",
                     {"message": message, "files": added_files, "stderr": stderr}
                 )
-            exit_with_error(
-                f"commit failed: {stderr}",
-                {"message": message, "files": added_files, "stderr": stderr}
-            )
+            # Non-hook failures: log and continue with remaining commits
+            record_error(f"commit failed: {error_detail}", {"message": message, "files": added_files})
+            print(f"  FAILED: {message} ({error_detail})")
+            failed_commits.append(message)
+            continue
         audit("commit_ok", {"message": message, "files": added_files})
         log("INFO", f"committed: {message}", {"files": len(added_files)})
         print(f"  {message}")
@@ -1365,6 +1380,9 @@ def main():
             log("INFO", "committed lockfiles", {"count": len(lockfiles)})
             print("  chore: update lockfiles")
 
+    if failed_commits:
+        warn(f"{len(failed_commits)} commit(s) failed: {', '.join(failed_commits)}")
+
     # Audit: check for remaining uncommitted changes
     remaining_staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     remaining_unstaged, _, _ = run(["git", "diff", "--name-only"])
@@ -1375,7 +1393,7 @@ def main():
         "untracked": [git_unquote(f) for f in remaining_untracked.strip().splitlines() if f],
     }
     has_remaining = any(remaining.values())
-    audit("finish", {"remaining": remaining, "clean": not has_remaining})
+    audit("finish", {"remaining": remaining, "clean": not has_remaining, "failed_commits": failed_commits})
     if has_remaining:
         total = sum(len(v) for v in remaining.values())
         warn(f"{total} files still uncommitted after run (check ~/.fastc/audit.jsonl)")
