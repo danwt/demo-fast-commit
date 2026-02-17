@@ -268,7 +268,7 @@ def build_pathspec_excludes():
     """Build git pathspec exclude args for lockfiles etc."""
     excludes = []
     for pattern in EXCLUDED_PATTERNS:
-        excludes.extend([":(exclude)" + pattern])
+        excludes.append(":(exclude)**/" + pattern)
     return excludes
 
 
