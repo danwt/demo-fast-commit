@@ -159,9 +159,9 @@ def warn(message, context=None):
     """Print warning to user and log it."""
     global _spinner
     if _spinner:
-        _spinner.warn(f"warning: {message}")
+        _spinner.warn(message)
     else:
-        print(f"  {WARN_SYM} {message}", file=sys.stderr)
+        print(f"{WARN_SYM} {message}", file=sys.stderr)
     log("INFO", message, context)
 
 
@@ -409,21 +409,6 @@ BULK_FILE_THRESHOLD = 200
 MAX_PHASE1_CHARS = 50000
 # LLM retry attempts when files are missed
 MAX_LLM_RETRIES = 3
-
-
-def parse_files_from_diff(diff):
-    """Extract the set of files mentioned in a diff."""
-    files = set()
-    for line in diff.splitlines():
-        if line.startswith("diff --git a/"):
-            parts = line.split(" b/")
-            if len(parts) == 2:
-                files.add(parts[1])
-        elif line.startswith("rename from "):
-            files.add(line[12:])
-        elif line.startswith("rename to "):
-            files.add(line[10:])
-    return files
 
 
 def is_lockfile(path):
@@ -715,7 +700,7 @@ def try_repair_json(content):
     for repair in repairs:
         try:
             result = json.loads(content + repair)
-            log("INFO", f"repaired truncated JSON with: {repair}")
+            warn(f"repaired truncated JSON (appended: {repair})")
             return result
         except json.JSONDecodeError:
             continue
@@ -727,7 +712,7 @@ def try_repair_json(content):
             for close in [']', ']}', '}]', ']}]', '"]}', '"],"hint":""}]']:
                 try:
                     result = json.loads(truncated + close)
-                    log("INFO", "repaired truncated JSON by removing incomplete element")
+                    warn("repaired truncated JSON by removing incomplete element")
                     return result
                 except json.JSONDecodeError:
                     continue
@@ -803,11 +788,6 @@ def call_llm_raw(config, system_prompt, user_content):
                 f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
                 {"model": config["MODEL"], "attempts": MAX_RETRIES, "last_error": str(e)}
             )
-    else:
-        exit_with_error(
-            f"LLM API failed after {MAX_RETRIES} attempts: {last_error}",
-            {"model": config["MODEL"], "attempts": MAX_RETRIES, "last_error": last_error}
-        )
     try:
         resp_json = resp.json()
     except json.JSONDecodeError as e:
@@ -1238,6 +1218,25 @@ def _print_commit_plan(commits, lockfiles):
 
 
 # ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+KEEP_LOGS = 50
+
+
+def _prune_old_logs():
+    """Delete session log files beyond the most recent KEEP_LOGS."""
+    if not LOGS_DIR.exists():
+        return
+    logs = sorted(LOGS_DIR.glob("session_*.log"))
+    for old in logs[:-KEEP_LOGS]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1253,6 +1252,7 @@ def main():
 
     log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk})
     log_git_state()
+    _prune_old_logs()
 
     config = load_config()
     log("INFO", f"using model: {config['MODEL']}")
@@ -1264,7 +1264,7 @@ def main():
     diff, source = get_diff()
     if not diff:
         _spinner.stop()
-        print("nothing to commit")
+        sprint("nothing to commit")
         return
 
     staged_files = get_staged_files_for_commit()
@@ -1272,7 +1272,7 @@ def main():
 
     if file_count == 0:
         _spinner.stop()
-        print("nothing to commit")
+        sprint("nothing to commit")
         return
 
     lockfiles = get_lockfiles_in_staging()
@@ -1315,12 +1315,12 @@ def main():
 
             if attempt < MAX_LLM_RETRIES:
                 missing_hint = missing
-                _spinner.warn(f"LLM missed {len(missing)} file(s), retrying ({attempt}/{MAX_LLM_RETRIES})...")
+                warn(f"LLM missed {len(missing)} file(s), retrying ({attempt}/{MAX_LLM_RETRIES})...")
             else:
-                exit_with_error(
-                    f"LLM missed {len(missing)} file(s) after {MAX_LLM_RETRIES} attempts — use --bulk to skip LLM grouping",
-                    {"missed": sorted(missing)}
-                )
+                warn(f"LLM missed files after {MAX_LLM_RETRIES} attempts, falling back to bulk mode")
+                log("INFO", "falling back to bulk mode after LLM retry exhaustion", {"missed": sorted(missing)})
+                commits = group_files_by_directory(staged_files)
+                break
 
         n = len(commits)
         _spinner.ok(f"Planned {n} commit{'s' if n != 1 else ''}")
