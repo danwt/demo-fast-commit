@@ -10,6 +10,7 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -30,16 +31,12 @@ def get_session_log():
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         _session_log = LOGS_DIR / f"session_{timestamp}.log"
-        # Write header
         _session_log.write_text(f"=== fastc session started: {datetime.now().isoformat()} ===\n")
     return _session_log
 
 
 def log(level, message, context=None):
-    """Log a message to the session log file.
-
-    Levels: DEBUG, INFO, ERROR
-    """
+    """Log a message to the session log file."""
     log_file = get_session_log()
     timestamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{timestamp}] {level}: {message}"
@@ -80,39 +77,111 @@ def log_git_state():
         log("INFO", f"failed to capture git state: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Spinner + output helpers
+# ---------------------------------------------------------------------------
+
+TICK = "✓"
+CROSS = "✗"
+WARN_SYM = "⚠"
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+_output_lock = threading.Lock()
+
+
+class Spinner:
+    """Thread-based terminal spinner. All output must go through this object
+    so that the spinner line is cleared before any print."""
+
+    def __init__(self):
+        self._msg = ""
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        i = 0
+        while not self._stop.wait(0.08):
+            with _output_lock:
+                frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+                sys.stdout.write(f"\r{frame} {self._msg}")
+                sys.stdout.flush()
+            i += 1
+
+    def set(self, message):
+        """Update the spinner message."""
+        self._msg = message
+
+    def _clear(self):
+        """Clear spinner line. Must be called with _output_lock held."""
+        sys.stdout.write("\r" + " " * (len(self._msg) + 4) + "\r")
+        sys.stdout.flush()
+
+    def println(self, message, file=sys.stdout):
+        """Print a line, temporarily pausing the spinner."""
+        with _output_lock:
+            self._clear()
+            print(message, file=file)
+
+    def ok(self, message):
+        self.println(f"{TICK} {message}")
+
+    def fail(self, message):
+        self.println(f"{CROSS} {message}", file=sys.stderr)
+
+    def warn(self, message):
+        self.println(f"{WARN_SYM} {message}", file=sys.stderr)
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join()
+        with _output_lock:
+            self._clear()
+
+
+_spinner: "Spinner | None" = None
+
+
+def sprint(message, file=sys.stdout):
+    """Print a message, clearing the spinner line first if one is active."""
+    global _spinner
+    if _spinner:
+        _spinner.println(message, file=file)
+    else:
+        print(message, file=file)
+
+
+# ---------------------------------------------------------------------------
+# Error / warning helpers
+# ---------------------------------------------------------------------------
+
 def warn(message, context=None):
-    """Print warning to user and log it (uses INFO level, not WARN)."""
-    print(f"  warning: {message}", file=sys.stderr)
+    """Print warning to user and log it."""
+    global _spinner
+    if _spinner:
+        _spinner.warn(f"warning: {message}")
+    else:
+        print(f"  {WARN_SYM} {message}", file=sys.stderr)
     log("INFO", message, context)
 
 
 def record_error(message, context=None):
     """Record error details to session log with full context."""
     log("ERROR", message, context)
-
-    # Also add stack trace if we're in an exception handler
     exc_info = traceback.format_exc()
     if exc_info and exc_info.strip() != "NoneType: None":
         log_file = get_session_log()
         with open(log_file, "a") as f:
             f.write(f"Stack trace:\n{exc_info}\n")
-
-    # Log git state for context
     log_git_state()
-
-    print(f"  session log: {get_session_log()}", file=sys.stderr)
+    sprint(f"  session log: {get_session_log()}", file=sys.stderr)
 
 
 _audit_repo = None
 
 
 def audit(event, data=None):
-    """Append a structured entry to the persistent audit log.
-
-    The audit log is a JSONL file (~/.fastc/audit.jsonl) that accumulates
-    across all runs. Each line is a JSON object with timestamp, repo, event
-    type, and event-specific data.
-    """
+    """Append a structured entry to the persistent audit log."""
     global _audit_repo
     AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
     if _audit_repo is None:
@@ -134,10 +203,20 @@ def audit(event, data=None):
 
 def exit_with_error(message, context=None):
     """Print error, record to disk, and exit."""
-    print(f"error: {message}", file=sys.stderr)
+    global _spinner
+    if _spinner:
+        _spinner.fail(f"error: {message}")
+        _spinner.stop()
+    else:
+        print(f"error: {message}", file=sys.stderr)
     record_error(message, context)
     audit("error", {"message": message})
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 # Files to exclude from diff analysis (don't help with commit messages)
 EXCLUDED_PATTERNS = [
@@ -232,6 +311,10 @@ GOOD OUTPUT:
 Respond with ONLY a valid JSON object (no markdown, no explanation):"""
 
 
+# ---------------------------------------------------------------------------
+# Config + git helpers
+# ---------------------------------------------------------------------------
+
 def load_config():
     if not CONFIG_PATH.exists():
         exit_with_error(
@@ -252,8 +335,14 @@ def load_config():
     return config
 
 
-def run(cmd, check=False):
-    result = subprocess.run(cmd, capture_output=True)
+def run(cmd, check=False, timeout=60):
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        exit_with_error(
+            f"command timed out after {timeout}s: {' '.join(cmd)}",
+            {"command": " ".join(cmd), "timeout": timeout}
+        )
     stdout = result.stdout.decode("utf-8", errors="replace")
     stderr = result.stderr.decode("utf-8", errors="replace")
     if check and result.returncode != 0:
@@ -318,6 +407,8 @@ MAX_OUTPUT_TOKENS = 4096
 BULK_FILE_THRESHOLD = 200
 # Maximum characters for phase 1 file summary before fallback
 MAX_PHASE1_CHARS = 50000
+# LLM retry attempts when files are missed
+MAX_LLM_RETRIES = 3
 
 
 def parse_files_from_diff(diff):
@@ -347,11 +438,7 @@ def is_lockfile(path):
 
 
 def git_unquote(path):
-    """Decode git's C-style quoted path.
-
-    Git quotes paths with non-ASCII or special chars using octal escapes:
-    "path/Age of Empires\\357\\274\\232 stuff" -> path/Age of Empires： stuff
-    """
+    """Decode git's C-style quoted path."""
     if not (path.startswith('"') and path.endswith('"')):
         return path
     inner = path[1:-1]
@@ -388,8 +475,6 @@ def get_staged_files_for_commit():
     """Get actual staged files that can be committed (excluding lockfiles).
 
     Returns dict mapping path -> {old_path, is_deleted}
-    This ensures we use paths that actually exist for git add/rm.
-    Lockfiles are excluded since they're committed separately.
     """
     name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M"])
     files = {}
@@ -415,18 +500,10 @@ def get_staged_files_for_commit():
 
 
 def normalize_llm_files(llm_files, staged_files):
-    """Map LLM file paths to actual staged paths.
-
-    The LLM might return old paths for renamed files or paths that don't exist.
-    This maps them to actual paths that git can work with.
-    Returns deduplicated list.
-    """
+    """Map LLM file paths to actual staged paths."""
     if not isinstance(llm_files, list):
         return []
-
-    # Build reverse lookup: old_path -> new_path
     old_to_new = {info["old"]: path for path, info in staged_files.items()}
-
     normalized = set()
     for f in llm_files:
         if not isinstance(f, str):
@@ -452,7 +529,6 @@ def is_echoing_keys(commit):
     message = commit.get("message")
     description = commit.get("description")
 
-    # Check if files is invalid
     if files is None:
         return True
     if isinstance(files, str) and files in ("files", "[]", "", "file"):
@@ -460,13 +536,11 @@ def is_echoing_keys(commit):
     if isinstance(files, list) and len(files) == 0:
         return True
 
-    # Check if message is just echoing the key name
     if message is None:
         return True
     if isinstance(message, str) and message.lower() in ("message", "", "commit message", "msg"):
         return True
 
-    # Check if description is just echoing the key name
     if isinstance(description, str) and description.lower() in ("description", "desc"):
         return True
 
@@ -476,10 +550,8 @@ def is_echoing_keys(commit):
 def validate_and_fix_commits(commits, staged_files):
     """Validate LLM output and fix issues.
 
-    - Normalizes file paths (handles renames)
-    - Removes invalid files
-    - Errors if any files are missing from groupings
-    - Returns fixed list of commits
+    Returns (fixed_commits, missing_files_set).
+    missing_files_set is empty when all staged files are covered.
     """
     # Detect key-echoing pattern (model failure)
     echo_count = sum(1 for c in commits if is_echoing_keys(c))
@@ -513,22 +585,17 @@ def validate_and_fix_commits(commits, staged_files):
             "description": commit.get("description", ""),
         })
 
-    missing_files = all_staged - covered_files
-    if missing_files:
-        # Add missing files to the last commit or create a new one
-        if fixed_commits:
-            warn(f"LLM missed {len(missing_files)} files, adding to last commit", {"files": list(missing_files)[:5]})
-            fixed_commits[-1]["files"].extend(list(missing_files))
-        else:
-            # No valid commits at all - create a fallback single commit
-            warn("LLM failed to group files, creating single commit")
-            fixed_commits.append({
-                "files": list(all_staged),
-                "message": "chore: update files",
-                "description": "",
-            })
+    if not fixed_commits:
+        # No valid commits at all - create a fallback single commit
+        warn("LLM failed to group files, creating single commit")
+        return [{
+            "files": list(all_staged),
+            "message": "chore: update files",
+            "description": "",
+        }], set()
 
-    return fixed_commits
+    missing_files = all_staged - covered_files
+    return fixed_commits, missing_files
 
 
 def get_diff_for_files(files):
@@ -538,14 +605,7 @@ def get_diff_for_files(files):
 
 
 def compress_diff(diff):
-    """Compress diff while preserving semantic information.
-
-    Strategy:
-    - Include --stat and --dirstat for overview
-    - Keep all hunk headers (@@...@@) which show function context
-    - Limit lines per hunk, prioritizing additions (+) over context
-    - Limit total hunks per file
-    """
+    """Compress diff while preserving semantic information."""
     excludes = build_pathspec_excludes()
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
     dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat", "--"] + excludes)
@@ -613,15 +673,7 @@ class ContextLengthExceeded(Exception):
 
 
 def try_repair_json(content):
-    """Attempt to repair truncated or malformed JSON arrays/objects.
-
-    Common issues:
-    - Leading garbage: .[{...  or ```json[{...
-    - Trailing garbage: }]...  or }]```
-    - Truncated mid-string: [..., "file  -> close string and array
-    - Truncated mid-object: [..., {"files": ["a"]  -> close object and array
-    - Object instead of array: {"files": [...]} when we expected [{...}]
-    """
+    """Attempt to repair truncated or malformed JSON arrays/objects."""
     content = content.strip()
 
     # Strip leading garbage - find first [ or {
@@ -642,45 +694,40 @@ def try_repair_json(content):
     if end_idx >= 0 and end_idx < len(content) - 1:
         content = content[:end_idx + 1]
 
-    # Try as-is first
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
 
-    # Try adding closing brackets/braces
     repairs = [
-        '"}]',      # truncated mid-string in array
-        '"]}}]',    # truncated mid-array in object in array
-        '"}]}]',    # truncated mid-string in nested structure
-        '"]',       # truncated mid-array
-        '"}',       # truncated mid-string in object
-        '}]',       # truncated mid-object in array
-        ']',        # truncated array
-        '}',        # truncated object
-        '"]}',      # truncated mid-string in array inside object (phase1 {"files": ["a", "b)
-        '"],"hint":""}]',  # phase1 truncated with hint missing
+        '"}]',
+        '"]}}]',
+        '"}]}]',
+        '"]',
+        '"}',
+        '}]',
+        ']',
+        '}',
+        '"]}',
+        '"],"hint":""}]',
     ]
 
     for repair in repairs:
         try:
             result = json.loads(content + repair)
-            print(f"  repaired truncated JSON with: {repair}")
+            log("INFO", f"repaired truncated JSON with: {repair}")
             return result
         except json.JSONDecodeError:
             continue
 
-    # Try removing the last incomplete element
-    # Find the last complete element (ends with }, or ])
     for end_char in ['},', '],', '}', ']', '",']:
         idx = content.rfind(end_char)
         if idx > 0:
             truncated = content[:idx + len(end_char)]
-            # Add closing brackets as needed
             for close in [']', ']}', '}]', ']}]', '"]}', '"],"hint":""}]']:
                 try:
                     result = json.loads(truncated + close)
-                    print(f"  repaired truncated JSON by removing incomplete element")
+                    log("INFO", "repaired truncated JSON by removing incomplete element")
                     return result
                 except json.JSONDecodeError:
                     continue
@@ -721,7 +768,6 @@ def call_llm_raw(config, system_prompt, user_content):
             if resp.status_code == 200:
                 break
             if resp.status_code == 400 and "context length" in resp.text.lower():
-                # Context length exceeded - signal caller to use fallback
                 log("INFO", "LLM context length exceeded", {"response": resp.text[:300]})
                 raise ContextLengthExceeded(resp.text[:500])
             if resp.status_code in RETRYABLE_STATUS_CODES:
@@ -783,28 +829,23 @@ def call_llm_raw(config, system_prompt, user_content):
         content = "\n".join(content.split("\n")[:-1])
     content = content.strip()
 
-    # Check if response was truncated (finish_reason)
     finish_reason = resp_json.get("choices", [{}])[0].get("finish_reason", "")
     if finish_reason == "length":
         warn("LLM response was truncated due to length limit")
 
-    # Handle empty response - return empty list to trigger fallback/retry logic
     if not content:
         record_error("LLM returned empty response", {"model": config["MODEL"]})
         return []
 
-    # Try normal parse first
     try:
         return json.loads(content)
     except json.JSONDecodeError:
         pass
 
-    # Try to repair truncated JSON
     repaired = try_repair_json(content)
     if repaired is not None:
         return repaired
 
-    # Return empty list instead of exiting - allows caller to fall back gracefully
     record_error(
         "LLM returned unparseable JSON",
         {"content": content[:1000], "model": config["MODEL"]}
@@ -830,20 +871,12 @@ def is_malformed_response(result):
         return True
     if not result:
         return True
-    # Check if all commits have key-echoing pattern
     echo_count = sum(1 for r in result if is_echoing_keys(r))
     return echo_count > len(result) // 2
 
 
 def normalize_llm_result(result):
-    """Normalize LLM result to a list of commits.
-
-    Handles various response formats:
-    - Direct array: [{...}, {...}]
-    - Object with commits key: {"commits": [{...}]}
-    - Object with groups key: {"groups": [{...}]}
-    - Single commit object: {"files": [...], "message": "..."}
-    """
+    """Normalize LLM result to a list of commits."""
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
@@ -856,17 +889,21 @@ def normalize_llm_result(result):
     return []
 
 
-def call_llm(config, diff):
-    """Single-phase: send diff and get commits."""
+def call_llm(config, diff, missing_hint=None):
+    """Single-phase: send diff and get commits.
+
+    missing_hint: set of file paths the LLM missed on a previous attempt.
+    """
     content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
-    log("INFO", f"sending diff to LLM", {"chars": len(content), "compressed": len(diff) > MAX_DIFF_CHARS})
+    if missing_hint:
+        hint_line = "IMPORTANT: You previously missed these files — they MUST be included: " + ", ".join(sorted(missing_hint))
+        content = hint_line + "\n\n" + content
+    log("INFO", "sending diff to LLM", {"chars": len(content), "compressed": len(diff) > MAX_DIFF_CHARS})
     result = call_llm_raw(config, SYSTEM_PROMPT, content)
     result = normalize_llm_result(result)
 
-    # Retry with stronger prompt if response looks malformed
     if is_malformed_response(result):
         warn("response looks malformed, retrying with stronger prompt")
-        # Use compressed version for retry to save tokens
         retry_content = compress_diff(diff) if len(diff) > MAX_DIFF_CHARS // 2 else content
         result = call_llm_raw(config, RETRY_PROMPT, retry_content)
         result = normalize_llm_result(result)
@@ -875,29 +912,19 @@ def call_llm(config, diff):
 
 
 def detect_directory_moves(staged_files):
-    """Detect directory-level rename/move operations.
-
-    Analyzes rename patterns to find cases like:
-    - tla-dump/a/x.txt -> refs/tla-dump/a/x.txt (move tla-dump/ under refs/)
-    - old-name/x.txt -> new-name/x.txt (rename directory)
-
-    Returns dict of {destination_prefix: (source_prefix, [files])}
-    """
+    """Detect directory-level rename/move operations."""
     from collections import defaultdict
 
-    # Group renames by the transformation pattern
-    # Key: (source_prefix, dest_prefix), Value: list of file paths
     transforms = defaultdict(list)
 
     for path, info in staged_files.items():
         old_path = info.get("old", path)
         if old_path == path or info.get("deleted"):
-            continue  # Not a rename
+            continue
 
         old_parts = old_path.split("/")
         new_parts = path.split("/")
 
-        # Find longest common suffix (the unchanged part of the path)
         common_suffix_len = 0
         for i in range(1, min(len(old_parts), len(new_parts)) + 1):
             if old_parts[-i] == new_parts[-i]:
@@ -909,13 +936,11 @@ def detect_directory_moves(staged_files):
             old_prefix = "/".join(old_parts[:-common_suffix_len])
             new_prefix = "/".join(new_parts[:-common_suffix_len])
         else:
-            # No common suffix, use parent directories
             old_prefix = "/".join(old_parts[:-1])
             new_prefix = "/".join(new_parts[:-1])
 
         transforms[(old_prefix, new_prefix)].append(path)
 
-    # Filter to significant moves (3+ files)
     return {
         new_prefix: (old_prefix, files)
         for (old_prefix, new_prefix), files in transforms.items()
@@ -924,38 +949,26 @@ def detect_directory_moves(staged_files):
 
 
 def summarize_file_operations(staged_files):
-    """Analyze staged files and return high-level operation summaries.
-
-    Returns list of dicts with:
-    - files: list of file paths
-    - message: commit message
-    - description: optional description
-    """
+    """Analyze staged files and return high-level operation summaries."""
     from collections import defaultdict
 
     operations = []
     handled_files = set()
 
-    # 1. Detect directory moves/renames
     dir_moves = detect_directory_moves(staged_files)
     for new_prefix, (old_prefix, files) in sorted(dir_moves.items(), key=lambda x: -len(x[1])):
-        # Skip already handled files
         files = [f for f in files if f not in handled_files]
         if len(files) < 3:
             continue
 
         handled_files.update(files)
-
-        # Generate message
         old_name = old_prefix.split("/")[-1] if old_prefix else "files"
         new_name = new_prefix.split("/")[-1] if new_prefix else "root"
 
         if old_prefix and new_prefix:
             if old_name == new_name:
-                # Same name, different location = move
                 msg = f"refactor: move {old_prefix}/ to {new_prefix}/"
             else:
-                # Different name = rename
                 msg = f"refactor: rename {old_prefix}/ to {new_prefix}/"
         elif new_prefix:
             msg = f"refactor: move files into {new_prefix}/"
@@ -968,10 +981,8 @@ def summarize_file_operations(staged_files):
             "description": f"{len(files)} files moved"
         })
 
-    # 2. Group remaining files by operation type and directory
     remaining = {p: info for p, info in staged_files.items() if p not in handled_files}
 
-    # Categorize by operation
     by_op_and_dir = defaultdict(lambda: defaultdict(list))
     for path, info in remaining.items():
         if info.get("deleted"):
@@ -981,10 +992,9 @@ def summarize_file_operations(staged_files):
         else:
             op = "add"
 
-        # Get directory (try different levels of granularity)
         parts = path.split("/")
         if len(parts) > 2:
-            dir_key = "/".join(parts[:2])  # Two levels deep
+            dir_key = "/".join(parts[:2])
         elif len(parts) > 1:
             dir_key = parts[0]
         else:
@@ -992,7 +1002,6 @@ def summarize_file_operations(staged_files):
 
         by_op_and_dir[op][dir_key].append(path)
 
-    # Generate operations for deletions
     for dir_key, files in by_op_and_dir["delete"].items():
         if len(files) >= 3:
             operations.append({
@@ -1011,7 +1020,6 @@ def summarize_file_operations(staged_files):
                 })
                 handled_files.add(f)
 
-    # Generate operations for additions
     for dir_key, files in by_op_and_dir["add"].items():
         if len(files) >= 3:
             operations.append({
@@ -1030,7 +1038,6 @@ def summarize_file_operations(staged_files):
                 })
                 handled_files.add(f)
 
-    # Generate operations for remaining renames (not part of a dir move)
     for dir_key, files in by_op_and_dir["rename"].items():
         if len(files) >= 3:
             operations.append({
@@ -1053,21 +1060,10 @@ def summarize_file_operations(staged_files):
 
 
 def group_files_by_directory(staged_files):
-    """Smart grouping that detects directory-level operations.
-
-    Uses file tree analysis to understand bulk operations like:
-    - Directory renames/moves
-    - Bulk deletions
-    - Bulk additions
-
-    Returns list of groups with files and meaningful commit messages.
-    """
+    """Smart grouping that detects directory-level operations."""
     operations = summarize_file_operations(staged_files)
-
     if operations:
         return operations
-
-    # Ultimate fallback: single commit with all files
     return [{
         "files": list(staged_files.keys()),
         "message": "chore: update files",
@@ -1075,42 +1071,41 @@ def group_files_by_directory(staged_files):
     }]
 
 
-def call_llm_two_phase(config, staged_files):
-    """Two-phase approach for large diffs with many files.
+def call_llm_two_phase(config, staged_files, missing_hint=None):
+    """Two-phase approach for large diffs with many files."""
+    global _spinner
 
-    Phase 1: Send file summary (name-status + stat) to get logical groupings
-    Phase 2: For each group, send actual diff to generate commit message
-    """
     excludes = build_pathspec_excludes()
     name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--"] + excludes)
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
 
     phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
+    if missing_hint:
+        hint_line = "IMPORTANT: You previously missed these files — include ALL of them: " + ", ".join(sorted(missing_hint))
+        phase1_content = hint_line + "\n\n" + phase1_content
 
-    # Check if phase1 content is too large for the LLM
     if len(phase1_content) > MAX_PHASE1_CHARS:
         warn(f"file summary too large ({len(phase1_content)} chars), grouping by directory instead")
         log("INFO", "skipping LLM phase 1 due to size", {"chars": len(phase1_content)})
         groups = group_files_by_directory(staged_files)
     else:
         log("INFO", "phase 1: sending file summary to LLM", {"chars": len(phase1_content)})
-        print("  phase 1: grouping files...")
+        if _spinner:
+            _spinner.set("Grouping files...")
         try:
             groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
         except ContextLengthExceeded:
             warn("LLM context length exceeded, falling back to directory grouping")
             groups = group_files_by_directory(staged_files)
 
-    # Handle case where LLM returns a dict with "groups" key instead of array
     if isinstance(groups, dict):
         groups = groups.get("groups", groups.get("commits", []))
 
     if not isinstance(groups, list):
-        warn(f"phase1 returned non-list ({type(groups).__name__}), using smart grouping")
+        warn(f"phase 1 returned non-list ({type(groups).__name__}), using smart grouping")
         groups = group_files_by_directory(staged_files)
 
     if not groups:
-        # Use smart grouping as fallback
         groups = group_files_by_directory(staged_files)
 
     commits = []
@@ -1121,7 +1116,6 @@ def call_llm_two_phase(config, staged_files):
         if not files:
             continue
 
-        # If group already has a message (from smart grouping), use it directly
         if group.get("message"):
             normalized = normalize_llm_files(files, staged_files) if isinstance(files[0], str) else files
             if normalized:
@@ -1132,12 +1126,12 @@ def call_llm_two_phase(config, staged_files):
                 })
             continue
 
-        # Normalize files to actual staged paths
         normalized = normalize_llm_files(files, staged_files)
         if not normalized:
             continue
 
-        print(f"  phase 2: generating message for group {i + 1}/{len(groups)}...")
+        if _spinner:
+            _spinner.set(f"Writing message {i + 1}/{len(groups)}...")
         group_diff = get_diff_for_files(normalized)
         if not group_diff.strip():
             continue
@@ -1148,7 +1142,6 @@ def call_llm_two_phase(config, staged_files):
             result = call_llm_raw(config, PHASE2_PROMPT, content)
         except ContextLengthExceeded:
             warn(f"context length exceeded for group {i + 1}, using smart analysis")
-            # Build staged_files subset for this group and analyze
             group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
             smart_ops = summarize_file_operations(group_staged)
             if smart_ops:
@@ -1159,7 +1152,6 @@ def call_llm_two_phase(config, staged_files):
                         "description": op.get("description", ""),
                     })
             else:
-                # Ultimate fallback: describe based on operation type
                 sample = staged_files.get(normalized[0], {})
                 if sample.get("deleted"):
                     msg = f"chore: remove {len(normalized)} files"
@@ -1170,11 +1162,10 @@ def call_llm_two_phase(config, staged_files):
                 commits.append({"files": normalized, "message": msg, "description": ""})
             continue
 
-        # Handle various response formats - extract dict from list if needed
         if isinstance(result, list) and len(result) > 0:
             result = result[0]
         if not isinstance(result, dict):
-            warn(f"phase2 returned non-dict for group {i + 1}, using smart analysis")
+            warn(f"phase 2 returned non-dict for group {i + 1}, using smart analysis")
             group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
             smart_ops = summarize_file_operations(group_staged)
             if smart_ops:
@@ -1184,14 +1175,13 @@ def call_llm_two_phase(config, staged_files):
 
         message = result.get("message")
         if not message or message.lower() in ("message", ""):
-            warn(f"phase2 missing message for group {i + 1}, using smart analysis")
+            warn(f"phase 2 missing message for group {i + 1}, using smart analysis")
             group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
             smart_ops = summarize_file_operations(group_staged)
             if smart_ops:
                 for op in smart_ops:
                     commits.append({"files": op["files"], "message": op["message"], "description": op.get("description", "")})
                 continue
-            # If smart analysis also fails, describe based on file count
             message = f"chore: update {len(normalized)} files"
 
         description = result.get("description", "")
@@ -1209,7 +1199,51 @@ def get_lockfiles_in_staging():
     return [git_unquote(f) for f in staged.strip().splitlines() if f and is_lockfile(git_unquote(f))]
 
 
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_files(files, limit=4):
+    """Format a file list compactly for display."""
+    shown = sorted(files)[:limit]
+    result = ", ".join(shown)
+    if len(files) > limit:
+        result += f" +{len(files) - limit} more"
+    return result
+
+
+def _print_commit_plan(commits, lockfiles):
+    """Print a numbered plan of all commits about to be made."""
+    all_entries = list(commits)
+    if lockfiles:
+        all_entries.append({
+            "message": "chore: update lockfiles",
+            "description": "",
+            "files": lockfiles,
+        })
+
+    sprint("")
+    sprint("  Planned commits:")
+    sprint("  " + "─" * 58)
+    for i, c in enumerate(all_entries, 1):
+        msg = c["message"]
+        desc = c.get("description", "")
+        files = c.get("files", [])
+        sprint(f"  {i:2d}  {msg}")
+        if desc:
+            sprint(f"       {desc}")
+        sprint(f"       {_fmt_files(files)}")
+    sprint("  " + "─" * 58)
+    sprint("")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
+    global _spinner
+
     parser = argparse.ArgumentParser(description="Fast commit with LLM-generated messages")
     parser.add_argument("--no-verify", action="store_true", help="bypass pre-commit hooks")
     parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
@@ -1223,8 +1257,13 @@ def main():
     config = load_config()
     log("INFO", f"using model: {config['MODEL']}")
 
+    _spinner = Spinner()
+
+    # --- Stage & collect ---
+    _spinner.set("Staging changes...")
     diff, source = get_diff()
     if not diff:
+        _spinner.stop()
         print("nothing to commit")
         return
 
@@ -1232,11 +1271,12 @@ def main():
     file_count = len(staged_files)
 
     if file_count == 0:
+        _spinner.stop()
         print("nothing to commit")
         return
 
-    # Check for lockfiles before we reset staging (must happen before reset)
     lockfiles = get_lockfiles_in_staging()
+    _spinner.ok(f"Staged {file_count} file{'s' if file_count != 1 else ''}")
 
     audit("start", {
         "source": source,
@@ -1245,50 +1285,58 @@ def main():
         "lockfiles": lockfiles,
     })
 
-    print(f"analysing {source} changes ({file_count} files)...")
-
-    # For very large file counts or explicit --bulk flag, use smart file tree analysis
+    # --- Generate commit plan ---
     if args.bulk or file_count > BULK_FILE_THRESHOLD:
-        if args.bulk:
-            print("  using smart bulk mode (--bulk flag)")
-            log("INFO", "using bulk mode (--bulk flag)", {"file_count": file_count})
-        else:
-            print(f"  large changeset ({file_count} files), using smart bulk mode")
-            log("INFO", "using bulk mode (auto)", {"file_count": file_count})
-
-        # Use smart file tree analysis to detect directory-level operations
+        mode = "--bulk flag" if args.bulk else f"{file_count} files"
+        _spinner.set(f"Grouping files ({mode})...")
         commits = group_files_by_directory(staged_files)
-        print(f"  detected {len(commits)} logical operations")
-    elif file_count > LARGE_DIFF_FILES:
-        print("  using two-phase approach for large diff")
-        commits = call_llm_two_phase(config, staged_files)
-        commits = validate_and_fix_commits(commits, staged_files)
+        _spinner.ok(f"Planned {len(commits)} commit{'s' if len(commits) != 1 else ''} (bulk)")
     else:
-        commits = call_llm(config, diff)
-        commits = validate_and_fix_commits(commits, staged_files)
+        missing_hint = None
+        commits = None
+
+        for attempt in range(1, MAX_LLM_RETRIES + 1):
+            if file_count > LARGE_DIFF_FILES:
+                _spinner.set("Grouping files...")
+                raw_commits = call_llm_two_phase(config, staged_files, missing_hint=missing_hint)
+            else:
+                label = f"Analysing {file_count} files"
+                if attempt > 1:
+                    label += f" (retry {attempt}/{MAX_LLM_RETRIES})"
+                _spinner.set(f"{label}...")
+                raw_commits = call_llm(config, diff, missing_hint=missing_hint)
+
+            commits, missing = validate_and_fix_commits(raw_commits, staged_files)
+
+            if not missing:
+                break
+
+            log("INFO", f"LLM missed files on attempt {attempt}", {"missed": sorted(missing)})
+
+            if attempt < MAX_LLM_RETRIES:
+                missing_hint = missing
+                _spinner.warn(f"LLM missed {len(missing)} file(s), retrying ({attempt}/{MAX_LLM_RETRIES})...")
+            else:
+                exit_with_error(
+                    f"LLM missed {len(missing)} file(s) after {MAX_LLM_RETRIES} attempts — use --bulk to skip LLM grouping",
+                    {"missed": sorted(missing)}
+                )
+
+        n = len(commits)
+        _spinner.ok(f"Planned {n} commit{'s' if n != 1 else ''}")
 
     if not commits:
+        _spinner.stop()
         exit_with_error("no valid commits generated", {"file_count": file_count})
 
+    _print_commit_plan(commits, lockfiles)
+
     if args.dry_run:
-        print("\ndry run - would create these commits:")
-        for commit in commits:
-            print(f"  {commit['message']}")
-            if commit.get("description"):
-                print(f"    {commit['description']}")
-            for f in commit["files"]:
-                print(f"    - {f}")
-        if lockfiles:
-            print(f"  chore: update lockfiles")
-            for f in lockfiles:
-                print(f"    - {f}")
+        _spinner.stop()
         audit("dry_run", {"commits": len(commits)})
         return
 
-    # Always reset index before commit loop so each commit only includes
-    # files explicitly staged for it. Without this, pre-staged files leak
-    # into the first commit (all staged files get committed, not just the
-    # intended subset).
+    # --- Execute commits ---
     run(["git", "reset", "HEAD"], check=True)
 
     commit_args = ["git", "commit"]
@@ -1296,21 +1344,22 @@ def main():
         commit_args.append("--no-verify")
 
     failed_commits = []
+    total = len(commits)
 
-    for commit in commits:
+    for idx, commit in enumerate(commits, 1):
         files = commit["files"]
         message = commit["message"]
         description = commit.get("description", "")
 
-        # Stage files: git rm for deletes, git add for adds/modifies,
-        # and for renames also rm the old path from the index
+        short_msg = message if len(message) <= 45 else message[:42] + "..."
+        _spinner.set(f"Committing {idx}/{total}: {short_msg}")
+
         added_files = []
         for f in files:
             if is_file_deleted(f, staged_files):
                 _, stderr, code = run(["git", "rm", "--cached", "--", f])
             else:
                 _, stderr, code = run(["git", "add", "--", f])
-                # For renames: also remove the old path from the index
                 info = staged_files.get(f, {})
                 old_path = info.get("old", f)
                 if code == 0 and old_path != f:
@@ -1325,52 +1374,49 @@ def main():
             audit("stage_skip", {"message": message, "skipped": skipped_files})
 
         if not added_files:
-            print(f"  skipping commit (no files staged): {message}")
+            _spinner.warn(f"skipping (no files staged): {message}")
             audit("commit_skip", {"message": message, "files": files})
             continue
 
-        # Verify something is actually staged before committing
         staged_check, _, _ = run(["git", "diff", "--cached", "--name-only"])
         if not staged_check.strip():
             warn(f"nothing staged after git add, skipping: {message}")
             audit("commit_skip", {"message": message, "files": added_files, "reason": "nothing_staged"})
             continue
 
-        # Use two -m flags: first for subject, second for body
         commit_cmd = commit_args + ["-m", message]
         if description:
             commit_cmd += ["-m", description]
         stdout, stderr, code = run(commit_cmd)
+
         if code != 0:
-            # git puts "nothing to commit" on stdout, not stderr
             error_detail = stderr.strip() or stdout.strip()
             audit("commit_fail", {"message": message, "files": added_files, "stderr": stderr.strip(), "stdout": stdout.strip()})
-            # Detect hook failures — these are fatal
             if "hook" in stderr.lower() or "pre-commit" in stderr.lower():
                 exit_with_error(
                     f"commit blocked by git hook. Fix the issues or use --no-verify to bypass",
                     {"message": message, "files": added_files, "stderr": stderr}
                 )
-            # Non-hook failures: log and continue with remaining commits
             record_error(f"commit failed: {error_detail}", {"message": message, "files": added_files})
-            print(f"  FAILED: {message} ({error_detail})")
+            _spinner.fail(f"FAILED: {message}")
             failed_commits.append(message)
             continue
+
         audit("commit_ok", {"message": message, "files": added_files})
         log("INFO", f"committed: {message}", {"files": len(added_files)})
-        print(f"  {message}")
+        _spinner.ok(message)
 
-    # Commit lockfiles separately with a simple message
+    # Commit lockfiles separately
     if lockfiles:
+        _spinner.set("Committing lockfiles...")
         run(["git", "add", "--"] + lockfiles, check=True)
-        # Verify something is actually staged before committing
         staged_check, _, _ = run(["git", "diff", "--cached", "--name-only"])
         if staged_check.strip():
             _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
             if code != 0:
                 if "hook" in stderr.lower():
                     exit_with_error(
-                        f"lockfile commit blocked by git hook. Use --no-verify to bypass",
+                        "lockfile commit blocked by git hook. Use --no-verify to bypass",
                         {"lockfiles": lockfiles, "stderr": stderr}
                     )
                 exit_with_error(
@@ -1378,12 +1424,12 @@ def main():
                     {"lockfiles": lockfiles, "stderr": stderr}
                 )
             log("INFO", "committed lockfiles", {"count": len(lockfiles)})
-            print("  chore: update lockfiles")
+            _spinner.ok("chore: update lockfiles")
 
     if failed_commits:
         warn(f"{len(failed_commits)} commit(s) failed: {', '.join(failed_commits)}")
 
-    # Audit: check for remaining uncommitted changes
+    # Audit remaining changes
     remaining_staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
     remaining_unstaged, _, _ = run(["git", "diff", "--name-only"])
     remaining_untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
@@ -1394,18 +1440,21 @@ def main():
     }
     has_remaining = any(remaining.values())
     audit("finish", {"remaining": remaining, "clean": not has_remaining, "failed_commits": failed_commits})
-    if has_remaining:
-        total = sum(len(v) for v in remaining.values())
-        warn(f"{total} files still uncommitted after run (check ~/.fastc/audit.jsonl)")
+
+    run_scope = set(staged_files.keys()) | set(lockfiles)
+    all_remaining = set(remaining["staged"]) | set(remaining["unstaged"]) | set(remaining["untracked"])
+    missed_from_run = all_remaining & run_scope
+    if missed_from_run:
+        warn(f"{len(missed_from_run)} files from this run still uncommitted (check ~/.fastc/audit.jsonl)")
 
     if args.no_push:
-        log("INFO", "session completed (push skipped)")
-        print("done (push skipped)")
+        _spinner.stop()
+        sprint("done (push skipped)")
         return
 
-    _, stderr, code = run(["git", "push"])
+    _spinner.set("Pushing...")
+    _, stderr, code = run(["git", "push"], timeout=120)
     if code != 0:
-        # Detect out-of-sync (rejected push)
         if "rejected" in stderr.lower() or "non-fast-forward" in stderr.lower():
             exit_with_error(
                 "push rejected: remote has changes. Run 'git pull' first to sync",
@@ -1417,11 +1466,12 @@ def main():
                 {"stderr": stderr}
             )
         exit_with_error("push failed", {"stderr": stderr})
+
     log("INFO", "pushed to remote")
     log("INFO", "session completed successfully")
-    print("pushed")
+    _spinner.ok("Pushed")
+    _spinner.stop()
 
 
 if __name__ == "__main__":
     main()
-
