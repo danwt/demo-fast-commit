@@ -1392,13 +1392,11 @@ def main():
         if code != 0:
             error_detail = stderr.strip() or stdout.strip()
             audit("commit_fail", {"message": message, "files": added_files, "stderr": stderr.strip(), "stdout": stdout.strip()})
-            if "hook" in stderr.lower() or "pre-commit" in stderr.lower():
-                exit_with_error(
-                    f"commit blocked by git hook. Fix the issues or use --no-verify to bypass",
-                    {"message": message, "files": added_files, "stderr": stderr}
-                )
             record_error(f"commit failed: {error_detail}", {"message": message, "files": added_files})
             _spinner.fail(f"FAILED: {message}")
+            if error_detail:
+                for line in error_detail.splitlines():
+                    sprint(f"       {line}", file=sys.stderr)
             failed_commits.append(message)
             continue
 
