@@ -410,6 +410,34 @@ MAX_PHASE1_CHARS = 50000
 # LLM retry attempts when files are missed
 MAX_LLM_RETRIES = 3
 
+BINARY_EXTENSIONS = {
+    '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp',
+    '.woff', '.woff2', '.ttf', '.eot', '.otf',
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx',
+    '.exe', '.dll', '.so', '.dylib', '.o', '.a',
+    '.pyc', '.class', '.jar',
+    '.db', '.sqlite', '.sqlite3', '.bin', '.dat',
+    '.mp3', '.mp4', '.avi', '.mov', '.wav',
+    '.lockb',
+}
+
+# Budget for compressed diff (chars). ~100K tokens at ~4 chars/token.
+MAX_COMPRESSED_CHARS = 400000
+
+
+def is_binary_path(path):
+    """Check if path has a known binary extension."""
+    dot = path.rfind(".")
+    return dot >= 0 and path[dot:].lower() in BINARY_EXTENSIONS
+
+
+def extract_diff_path(header):
+    """Extract file path from 'diff --git a/X b/Y' header."""
+    if " b/" in header:
+        return header.split(" b/", 1)[1]
+    return ""
+
 
 def is_lockfile(path):
     """Check if a file path matches any lockfile pattern."""
@@ -589,8 +617,15 @@ def get_diff_for_files(files):
     return strip_diff_noise(diff)
 
 
-def compress_diff(diff):
-    """Compress diff while preserving semantic information."""
+def compress_diff(diff, max_chars=None):
+    """Compress diff while preserving semantic information.
+
+    Respects a total character budget, skips binary files, and enforces
+    per-file limits so the result fits within LLM context windows.
+    """
+    if max_chars is None:
+        max_chars = MAX_COMPRESSED_CHARS
+
     excludes = build_pathspec_excludes()
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
     dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat", "--"] + excludes)
@@ -598,53 +633,102 @@ def compress_diff(diff):
     parts = [f"DIFF STAT:\n{stat}"]
     if dirstat.strip():
         parts.append(f"DIRECTORY CHANGES:\n{dirstat}")
-    parts.append("COMPRESSED PATCHES:")
 
-    current_file_header = None
-    current_file_lines = []
-    hunk_count = 0
-    hunk_lines = 0
-    hunk_truncated = False
+    header_chars = sum(len(p) for p in parts) + 50
+    remaining = max_chars - header_chars
+    if remaining <= 0:
+        return "\n".join(parts)
 
-    def flush_file():
-        nonlocal current_file_header, current_file_lines, hunk_count
-        if current_file_header:
-            parts.append(current_file_header)
-            parts.extend(current_file_lines)
-            if hunk_count > MAX_HUNKS_PER_FILE:
-                parts.append(f"[... {hunk_count - MAX_HUNKS_PER_FILE} more hunks truncated]")
-        current_file_header = None
-        current_file_lines = []
-        hunk_count = 0
-
+    # Parse diff into per-file sections
+    file_sections = []
+    current_header = None
+    current_lines = []
     for line in diff.splitlines():
         if line.startswith("diff --git"):
-            flush_file()
-            current_file_header = line
-            hunk_count = 0
-        elif line.startswith("@@") and " @@" in line:
-            hunk_count += 1
-            hunk_lines = 0
-            hunk_truncated = False
-            if hunk_count <= MAX_HUNKS_PER_FILE:
-                current_file_lines.append(line)
-        elif current_file_header and hunk_count <= MAX_HUNKS_PER_FILE:
-            if line.startswith("---") or line.startswith("+++"):
-                current_file_lines.append(line)
-            elif line.startswith("rename ") or line.startswith("new file") or line.startswith("deleted file"):
-                current_file_lines.append(line)
-            elif hunk_lines < MAX_LINES_PER_HUNK:
-                if line.startswith("+") or line.startswith("-"):
-                    current_file_lines.append(line)
-                    hunk_lines += 1
-                elif line.startswith(" ") and hunk_lines < MAX_LINES_PER_HUNK // 2:
-                    current_file_lines.append(line)
-                    hunk_lines += 1
-            elif not hunk_truncated:
-                current_file_lines.append("[... hunk truncated]")
-                hunk_truncated = True
+            if current_header:
+                file_sections.append((current_header, current_lines))
+            current_header = line
+            current_lines = []
+        elif current_header:
+            current_lines.append(line)
+    if current_header:
+        file_sections.append((current_header, current_lines))
 
-    flush_file()
+    if not file_sections:
+        return "\n".join(parts)
+
+    parts.append("COMPRESSED PATCHES:")
+    total_chars = 0
+    files_truncated = 0
+
+    for file_header, lines in file_sections:
+        if total_chars >= remaining:
+            files_truncated += 1
+            continue
+
+        path = extract_diff_path(file_header)
+
+        # Skip binary files
+        is_binary = any("Binary files" in l for l in lines[:5])
+        if is_binary or is_binary_path(path):
+            summary = f"{file_header}\n[binary file]"
+            parts.append(summary)
+            total_chars += len(summary)
+            continue
+
+        # Compress this file's diff with per-file budget
+        per_file_budget = min(
+            remaining - total_chars,
+            remaining // max(len(file_sections), 1),
+        )
+
+        file_parts = [file_header]
+        file_chars = len(file_header)
+        hunk_count = 0
+        hunk_lines = 0
+        hunk_truncated = False
+
+        for line in lines:
+            if file_chars >= per_file_budget:
+                file_parts.append("[... file truncated]")
+                break
+
+            if line.startswith("@@") and " @@" in line:
+                hunk_count += 1
+                hunk_lines = 0
+                hunk_truncated = False
+                if hunk_count <= MAX_HUNKS_PER_FILE:
+                    file_parts.append(line)
+                    file_chars += len(line)
+            elif hunk_count <= MAX_HUNKS_PER_FILE:
+                if line.startswith("---") or line.startswith("+++"):
+                    file_parts.append(line)
+                    file_chars += len(line)
+                elif line.startswith("rename ") or line.startswith("new file") or line.startswith("deleted file"):
+                    file_parts.append(line)
+                    file_chars += len(line)
+                elif hunk_lines < MAX_LINES_PER_HUNK:
+                    if line.startswith("+") or line.startswith("-"):
+                        file_parts.append(line)
+                        file_chars += len(line)
+                        hunk_lines += 1
+                    elif line.startswith(" ") and hunk_lines < MAX_LINES_PER_HUNK // 2:
+                        file_parts.append(line)
+                        file_chars += len(line)
+                        hunk_lines += 1
+                elif not hunk_truncated:
+                    file_parts.append("[... hunk truncated]")
+                    hunk_truncated = True
+
+        if hunk_count > MAX_HUNKS_PER_FILE:
+            file_parts.append(f"[... {hunk_count - MAX_HUNKS_PER_FILE} more hunks truncated]")
+
+        parts.extend(file_parts)
+        total_chars += file_chars
+
+    if files_truncated > 0:
+        parts.append(f"[... {files_truncated} more files truncated]")
+
     return "\n".join(parts)
 
 
@@ -1304,7 +1388,12 @@ def main():
                 if attempt > 1:
                     label += f" (retry {attempt}/{MAX_LLM_RETRIES})"
                 _spinner.set(f"{label}...")
-                raw_commits = call_llm(config, diff, missing_hint=missing_hint)
+                try:
+                    raw_commits = call_llm(config, diff, missing_hint=missing_hint)
+                except ContextLengthExceeded:
+                    warn("diff too large, using bulk mode")
+                    commits = group_files_by_directory(staged_files)
+                    break
 
             commits, missing = validate_and_fix_commits(raw_commits, staged_files)
 
