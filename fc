@@ -1020,6 +1020,7 @@ def summarize_file_operations(staged_files):
 
         handled_files.update(files)
         old_name = old_prefix.split("/")[-1] if old_prefix else "files"
+        new_name = new_prefix.split("/")[-1] if new_prefix else "root"
 
         if old_prefix and new_prefix:
             if old_name == new_name:
