@@ -376,25 +376,28 @@ def strip_diff_noise(diff):
 
 
 def get_diff():
-    """Get diff for analysis, excluding lockfiles from LLM context."""
+    """Get diff for analysis, excluding lockfiles from LLM context.
+
+    Only considers files in the current working directory and below.
+    """
     excludes = build_pathspec_excludes()
-    staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
+    staged, _, _ = run(["git", "diff", "--cached", "--name-only", "--", "."])
     if staged.strip():
-        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--", "."] + excludes)
         diff = strip_diff_noise(diff)
         if diff:
             return diff, "staged"
         # Staged files were all lockfiles/excluded — fall through to check unstaged
-    diff, _, _ = run(["git", "diff", "--minimal"])
+    diff, _, _ = run(["git", "diff", "--minimal", "--", "."])
     if not diff.strip():
-        untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
+        untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard", "."])
         if not untracked.strip():
             return "", "none"
-        run(["git", "add", "-A"], check=True)
-        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
+        run(["git", "add", "-A", "."], check=True)
+        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--", "."] + excludes)
         return strip_diff_noise(diff), "all"
-    run(["git", "add", "-A"], check=True)
-    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + excludes)
+    run(["git", "add", "-A", "."], check=True)
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--", "."] + excludes)
     return strip_diff_noise(diff), "all"
 
 
@@ -487,9 +490,10 @@ def git_unquote(path):
 def get_staged_files_for_commit():
     """Get actual staged files that can be committed (excluding lockfiles).
 
+    Only includes files in the current working directory and below.
     Returns dict mapping path -> {old_path, is_deleted}
     """
-    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M"])
+    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--", "."])
     files = {}
     for line in name_status.strip().splitlines():
         if not line:
@@ -1258,8 +1262,8 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
 
 
 def get_lockfiles_in_staging():
-    """Get list of lockfiles that are staged."""
-    staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
+    """Get list of lockfiles that are staged in the current directory and below."""
+    staged, _, _ = run(["git", "diff", "--cached", "--name-only", "--", "."])
     return [git_unquote(f) for f in staged.strip().splitlines() if f and is_lockfile(git_unquote(f))]
 
 
@@ -1426,7 +1430,7 @@ def main():
         return
 
     # --- Execute commits ---
-    run(["git", "reset", "HEAD"], check=True)
+    run(["git", "reset", "HEAD", "--", "."], check=True)
 
     commit_args = ["git", "commit"]
     if args.no_verify:
@@ -1517,9 +1521,9 @@ def main():
         warn(f"{len(failed_commits)} commit(s) failed: {', '.join(failed_commits)}")
 
     # Audit remaining changes
-    remaining_staged, _, _ = run(["git", "diff", "--cached", "--name-only"])
-    remaining_unstaged, _, _ = run(["git", "diff", "--name-only"])
-    remaining_untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard"])
+    remaining_staged, _, _ = run(["git", "diff", "--cached", "--name-only", "--", "."])
+    remaining_unstaged, _, _ = run(["git", "diff", "--name-only", "--", "."])
+    remaining_untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard", "."])
     remaining = {
         "staged": [git_unquote(f) for f in remaining_staged.strip().splitlines() if f],
         "unstaged": [git_unquote(f) for f in remaining_unstaged.strip().splitlines() if f],
