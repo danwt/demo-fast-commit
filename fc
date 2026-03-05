@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -144,7 +145,6 @@ _spinner: "Spinner | None" = None
 
 def sprint(message, file=sys.stdout):
     """Print a message, clearing the spinner line first if one is active."""
-    global _spinner
     if _spinner:
         _spinner.println(message, file=file)
     else:
@@ -157,7 +157,6 @@ def sprint(message, file=sys.stdout):
 
 def warn(message, context=None):
     """Print warning to user and log it."""
-    global _spinner
     if _spinner:
         _spinner.warn(message)
     else:
@@ -203,7 +202,6 @@ def audit(event, data=None):
 
 def exit_with_error(message, context=None):
     """Print error, record to disk, and exit."""
-    global _spinner
     if _spinner:
         _spinner.fail(f"error: {message}")
         _spinner.stop()
@@ -631,8 +629,8 @@ def compress_diff(diff, max_chars=None):
         max_chars = MAX_COMPRESSED_CHARS
 
     excludes = build_pathspec_excludes()
-    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
-    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat", "--"] + excludes)
+    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--", "."] + excludes)
+    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat", "--", "."] + excludes)
 
     parts = [f"DIFF STAT:\n{stat}"]
     if dirstat.strip():
@@ -826,7 +824,6 @@ def call_llm_raw(config, system_prompt, user_content):
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
 
-    last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.post(
@@ -843,19 +840,16 @@ def call_llm_raw(config, system_prompt, user_content):
             if resp.status_code == 400 and "context length" in resp.text.lower():
                 log("INFO", "LLM context length exceeded", {"response": resp.text[:300]})
                 raise ContextLengthExceeded(resp.text[:500])
-            if resp.status_code in RETRYABLE_STATUS_CODES:
-                last_error = f"API returned {resp.status_code}: {resp.text[:200]}"
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2**attempt
-                    warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                    time.sleep(wait_time)
-                    continue
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                wait_time = 2**attempt
+                warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+                continue
             exit_with_error(
                 f"LLM API returned {resp.status_code}",
                 {"status_code": resp.status_code, "response": resp.text[:500], "model": config["MODEL"]}
             )
         except requests.exceptions.Timeout:
-            last_error = "request timed out"
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2**attempt
                 warn(f"LLM request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
@@ -866,7 +860,6 @@ def call_llm_raw(config, system_prompt, user_content):
                 {"model": config["MODEL"], "attempts": MAX_RETRIES}
             )
         except requests.exceptions.RequestException as e:
-            last_error = str(e)
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2**attempt
                 warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
@@ -874,7 +867,7 @@ def call_llm_raw(config, system_prompt, user_content):
                 continue
             exit_with_error(
                 f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
-                {"model": config["MODEL"], "attempts": MAX_RETRIES, "last_error": str(e)}
+                {"model": config["MODEL"], "attempts": MAX_RETRIES}
             )
     try:
         resp_json = resp.json()
@@ -981,8 +974,6 @@ def call_llm(config, diff, missing_hint=None):
 
 def detect_directory_moves(staged_files):
     """Detect directory-level rename/move operations."""
-    from collections import defaultdict
-
     transforms = defaultdict(list)
 
     for path, info in staged_files.items():
@@ -1018,8 +1009,6 @@ def detect_directory_moves(staged_files):
 
 def summarize_file_operations(staged_files):
     """Analyze staged files and return high-level operation summaries."""
-    from collections import defaultdict
-
     operations = []
     handled_files = set()
 
@@ -1031,7 +1020,6 @@ def summarize_file_operations(staged_files):
 
         handled_files.update(files)
         old_name = old_prefix.split("/")[-1] if old_prefix else "files"
-        new_name = new_prefix.split("/")[-1] if new_prefix else "root"
 
         if old_prefix and new_prefix:
             if old_name == new_name:
@@ -1058,7 +1046,7 @@ def summarize_file_operations(staged_files):
         elif info.get("old") != path:
             op = "rename"
         else:
-            op = "add"
+            op = "change"
 
         parts = path.split("/")
         if len(parts) > 2:
@@ -1070,59 +1058,28 @@ def summarize_file_operations(staged_files):
 
         by_op_and_dir[op][dir_key].append(path)
 
-    for dir_key, files in by_op_and_dir["delete"].items():
-        if len(files) >= 3:
-            operations.append({
-                "files": files,
-                "message": f"chore: remove {dir_key}/",
-                "description": f"{len(files)} files deleted"
-            })
-            handled_files.update(files)
-        else:
-            for f in files:
-                fname = f.split("/")[-1]
+    op_templates = [
+        ("delete",  "chore: remove {dir}/",            "chore: remove {file}",            "deleted"),
+        ("change",  "chore: update {dir}/",             "chore: update {file}",            "changed"),
+        ("rename",  "refactor: rename files in {dir}/", "refactor: rename {file}",         "renamed"),
+    ]
+    for op_key, bulk_tmpl, single_tmpl, verb in op_templates:
+        for dir_key, files in by_op_and_dir[op_key].items():
+            if len(files) >= 3:
                 operations.append({
-                    "files": [f],
-                    "message": f"chore: remove {fname}",
-                    "description": ""
+                    "files": files,
+                    "message": bulk_tmpl.format(dir=dir_key),
+                    "description": f"{len(files)} files {verb}"
                 })
-                handled_files.add(f)
-
-    for dir_key, files in by_op_and_dir["add"].items():
-        if len(files) >= 3:
-            operations.append({
-                "files": files,
-                "message": f"feat: add {dir_key}/",
-                "description": f"{len(files)} files added"
-            })
-            handled_files.update(files)
-        else:
-            for f in files:
-                fname = f.split("/")[-1]
-                operations.append({
-                    "files": [f],
-                    "message": f"feat: add {fname}",
-                    "description": ""
-                })
-                handled_files.add(f)
-
-    for dir_key, files in by_op_and_dir["rename"].items():
-        if len(files) >= 3:
-            operations.append({
-                "files": files,
-                "message": f"refactor: rename files in {dir_key}/",
-                "description": f"{len(files)} files renamed"
-            })
-            handled_files.update(files)
-        else:
-            for f in files:
-                fname = f.split("/")[-1]
-                operations.append({
-                    "files": [f],
-                    "message": f"refactor: rename {fname}",
-                    "description": ""
-                })
-                handled_files.add(f)
+                handled_files.update(files)
+            else:
+                for f in files:
+                    operations.append({
+                        "files": [f],
+                        "message": single_tmpl.format(file=f.split("/")[-1]),
+                        "description": ""
+                    })
+                    handled_files.add(f)
 
     return operations
 
@@ -1139,13 +1096,20 @@ def group_files_by_directory(staged_files):
     }]
 
 
+def _smart_fallback_commits(normalized, staged_files):
+    """Generate commits from smart file analysis when LLM fails."""
+    group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
+    smart_ops = summarize_file_operations(group_staged)
+    if smart_ops:
+        return [{"files": op["files"], "message": op["message"], "description": op.get("description", "")} for op in smart_ops]
+    return []
+
+
 def call_llm_two_phase(config, staged_files, missing_hint=None):
     """Two-phase approach for large diffs with many files."""
-    global _spinner
-
     excludes = build_pathspec_excludes()
-    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--"] + excludes)
-    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--"] + excludes)
+    name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--", "."] + excludes)
+    stat, _, _ = run(["git", "diff", "--cached", "--stat", "--", "."] + excludes)
 
     phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
     if missing_hint:
@@ -1210,45 +1174,22 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
             result = call_llm_raw(config, PHASE2_PROMPT, content)
         except ContextLengthExceeded:
             warn(f"context length exceeded for group {i + 1}, using smart analysis")
-            group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
-            smart_ops = summarize_file_operations(group_staged)
-            if smart_ops:
-                for op in smart_ops:
-                    commits.append({
-                        "files": op["files"],
-                        "message": op["message"],
-                        "description": op.get("description", ""),
-                    })
-            else:
-                sample = staged_files.get(normalized[0], {})
-                if sample.get("deleted"):
-                    msg = f"chore: remove {len(normalized)} files"
-                elif sample.get("old") != normalized[0]:
-                    msg = f"refactor: rename {len(normalized)} files"
-                else:
-                    msg = f"chore: update {len(normalized)} files"
-                commits.append({"files": normalized, "message": msg, "description": ""})
+            commits.extend(_smart_fallback_commits(normalized, staged_files))
             continue
 
         if isinstance(result, list) and len(result) > 0:
             result = result[0]
         if not isinstance(result, dict):
             warn(f"phase 2 returned non-dict for group {i + 1}, using smart analysis")
-            group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
-            smart_ops = summarize_file_operations(group_staged)
-            if smart_ops:
-                for op in smart_ops:
-                    commits.append({"files": op["files"], "message": op["message"], "description": op.get("description", "")})
+            commits.extend(_smart_fallback_commits(normalized, staged_files))
             continue
 
         message = result.get("message")
         if not message or message.lower() in ("message", ""):
             warn(f"phase 2 missing message for group {i + 1}, using smart analysis")
-            group_staged = {f: staged_files[f] for f in normalized if f in staged_files}
-            smart_ops = summarize_file_operations(group_staged)
-            if smart_ops:
-                for op in smart_ops:
-                    commits.append({"files": op["files"], "message": op["message"], "description": op.get("description", "")})
+            fallback = _smart_fallback_commits(normalized, staged_files)
+            if fallback:
+                commits.extend(fallback)
                 continue
             message = f"chore: update {len(normalized)} files"
 
