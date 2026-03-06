@@ -812,9 +812,18 @@ def try_repair_json(content):
     return None
 
 
+class _LLMWallClockTimeout(Exception):
+    pass
+
+
 def call_llm_raw(config, system_prompt, user_content):
     """Make a raw LLM API call and return parsed JSON."""
+    import signal
+
     import requests
+
+    def _alarm_handler(signum, frame):
+        raise _LLMWallClockTimeout()
 
     use_structured = config.get("STRUCTURED_OUTPUT", "true").lower() == "true"
 
@@ -830,8 +839,12 @@ def call_llm_raw(config, system_prompt, user_content):
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
 
+    wall_clock_timeout = 90  # total seconds per attempt, kills chunked-transfer hangs
+    old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+
     for attempt in range(MAX_RETRIES):
         try:
+            signal.alarm(wall_clock_timeout)
             resp = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
@@ -841,6 +854,7 @@ def call_llm_raw(config, system_prompt, user_content):
                 json=request_body,
                 timeout=60,
             )
+            signal.alarm(0)
             if resp.status_code == 200:
                 break
             if resp.status_code == 400 and "context length" in resp.text.lower():
@@ -855,7 +869,19 @@ def call_llm_raw(config, system_prompt, user_content):
                 f"LLM API returned {resp.status_code}",
                 {"status_code": resp.status_code, "response": resp.text[:500], "model": config["MODEL"]}
             )
+        except _LLMWallClockTimeout:
+            signal.alarm(0)
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2**attempt
+                warn(f"LLM request exceeded {wall_clock_timeout}s wall-clock timeout, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+                continue
+            exit_with_error(
+                f"LLM API request timed out after {MAX_RETRIES} attempts",
+                {"model": config["MODEL"], "attempts": MAX_RETRIES}
+            )
         except requests.exceptions.Timeout:
+            signal.alarm(0)
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2**attempt
                 warn(f"LLM request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
@@ -866,6 +892,7 @@ def call_llm_raw(config, system_prompt, user_content):
                 {"model": config["MODEL"], "attempts": MAX_RETRIES}
             )
         except requests.exceptions.RequestException as e:
+            signal.alarm(0)
             if attempt < MAX_RETRIES - 1:
                 wait_time = 2**attempt
                 warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
@@ -875,6 +902,9 @@ def call_llm_raw(config, system_prompt, user_content):
                 f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
                 {"model": config["MODEL"], "attempts": MAX_RETRIES}
             )
+
+    signal.alarm(0)
+    signal.signal(signal.SIGALRM, old_alarm_handler)
     try:
         resp_json = resp.json()
     except json.JSONDecodeError as e:
