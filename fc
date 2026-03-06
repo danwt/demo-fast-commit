@@ -359,6 +359,12 @@ def build_pathspec_excludes():
     return excludes
 
 
+def _top(path):
+    """Wrap a repo-root-relative path with :(top) so git resolves it from
+    the repo root regardless of CWD."""
+    return f":(top){path}"
+
+
 def strip_diff_noise(diff):
     """Remove noise lines from diff to save tokens."""
     lines = []
@@ -615,7 +621,7 @@ def validate_and_fix_commits(commits, staged_files):
 
 def get_diff_for_files(files):
     """Get the diff for specific files only."""
-    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + list(files))
+    diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + [_top(f) for f in files])
     return strip_diff_noise(diff)
 
 
@@ -1392,13 +1398,13 @@ def main():
         added_files = []
         for f in files:
             if is_file_deleted(f, staged_files):
-                _, stderr, code = run(["git", "rm", "--cached", "--", f])
+                _, stderr, code = run(["git", "rm", "--cached", "--", _top(f)])
             else:
-                _, stderr, code = run(["git", "add", "--", f])
+                _, stderr, code = run(["git", "add", "--", _top(f)])
                 info = staged_files.get(f, {})
                 old_path = info.get("old", f)
                 if code == 0 and old_path != f:
-                    run(["git", "rm", "--cached", "--", old_path])
+                    run(["git", "rm", "--cached", "--", _top(old_path)])
             if code == 0:
                 added_files.append(f)
             else:
@@ -1442,7 +1448,7 @@ def main():
     # Commit lockfiles separately
     if lockfiles:
         _spinner.set("Committing lockfiles...")
-        run(["git", "add", "--"] + lockfiles, check=True)
+        run(["git", "add", "--"] + [_top(f) for f in lockfiles], check=True)
         staged_check, _, _ = run(["git", "diff", "--cached", "--name-only"])
         if staged_check.strip():
             _, stderr, code = run(commit_args + ["-m", "chore: update lockfiles"])
