@@ -476,6 +476,7 @@ def normalize_llm_files(llm_files, staged_files):
         return []
     old_to_new = {info["old"]: path for path, info in staged_files.items()}
     normalized = set()
+    dropped = []
     for f in llm_files:
         if not isinstance(f, str):
             continue
@@ -486,13 +487,17 @@ def normalize_llm_files(llm_files, staged_files):
             normalized.add(f)
         elif f in old_to_new:
             normalized.add(old_to_new[f])
+        else:
+            dropped.append(f)
+    if dropped:
+        log("INFO", "LLM referenced unknown files", {"dropped": dropped})
     return list(normalized)
 
 
 def is_file_deleted(path, staged_files):
     """Check if a file is marked as deleted in staged files."""
     info = staged_files.get(path)
-    return info["deleted"] if info else False
+    return info.get("deleted", False) if info else False
 
 
 def is_echoing_keys(commit):
@@ -1389,7 +1394,9 @@ def execute_commits(commits, lockfiles, staged_files, no_verify):
             _spinner.fail(f"FAILED: {message}")
             if error_detail:
                 for line in error_detail.splitlines():
-                    sprint(f"       {line}", file=sys.stderr)
+                    sprint(f"       {_dim(line)}", file=sys.stderr)
+            if "hook" in (stderr + stdout).lower():
+                sprint(f"       {_dim('hint: use --no-verify to bypass hooks')}", file=sys.stderr)
             failed_commits.append(message)
             continue
 
