@@ -1490,11 +1490,15 @@ def main():
         _spinner.set("Staging changes...")
         diff, source = get_diff()
         if not diff:
+            if source == "all":
+                run(["git", "reset", "HEAD", "--", "."])
             sprint("nothing to commit")
             return
 
         staged_files = get_staged_files_for_commit()
         if not staged_files:
+            if source == "all":
+                run(["git", "reset", "HEAD", "--", "."])
             sprint("nothing to commit")
             return
 
