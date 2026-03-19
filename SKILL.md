@@ -21,6 +21,7 @@ fastc                # analyse, commit, and push
 fastc --dry-run      # preview commits without executing
 fastc --no-push      # commit but don't push
 fastc --no-verify    # bypass pre-commit hooks
+fastc --bulk         # skip LLM, use smart file tree analysis
 ```
 
 ## Prerequisites

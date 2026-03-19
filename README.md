@@ -8,15 +8,23 @@ Zero-config CLI tool that analyses your git diff with an LLM and creates atomic,
 
 ```
 $ fastc
-analysing all changes (12 files)...
-  using two-phase approach for large diff
-  phase 1: grouping files...
-  phase 2: generating message for group 1/2...
-  phase 2: generating message for group 2/2...
-  feat(auth): add JWT token validation
-  refactor(db): extract connection pool config
-  chore: update lockfiles
-pushed
+✓ Staged 12 files
+✓ Planned 3 commits
+
+  Planned commits:
+  ──────────────────────────────────────────────────────────
+   1  feat(auth): add JWT token validation
+       src/auth.go, src/auth_test.go
+   2  refactor(db): extract connection pool config
+       src/db.go, src/config.go +2 more
+   3  chore: update lockfiles
+       go.sum
+  ──────────────────────────────────────────────────────────
+
+✓ feat(auth): add JWT token validation
+✓ refactor(db): extract connection pool config
+✓ chore: update lockfiles
+✓ Pushed
 ```
 
 ## Features
@@ -56,6 +64,7 @@ fastc                # analyse, commit, and push
 fastc --dry-run      # preview commits without executing
 fastc --no-push      # commit but don't push
 fastc --no-verify    # bypass pre-commit hooks
+fastc --bulk         # skip LLM, use smart file tree analysis
 ```
 
 The tool will:
@@ -98,6 +107,12 @@ These files are excluded from LLM analysis (but still committed):
 
 - **Lockfiles**: `pnpm-lock.yaml`, `package-lock.json`, `yarn.lock`, `bun.lockb`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `go.sum`, `composer.lock`, `Gemfile.lock`
 - **Generated**: `*.min.js`, `*.min.css`, `*.map`
+
+## Testing
+
+```bash
+uv run --with pytest pytest test_fc.py -v
+```
 
 ## Claude Code integration
 
