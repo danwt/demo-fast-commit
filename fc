@@ -1485,6 +1485,10 @@ def main():
     config = load_config()
     log("INFO", "using model", {"model": config["MODEL"]})
 
+    _, _, rc = run(["git", "rev-parse", "--git-dir"])
+    if rc != 0:
+        exit_with_error("not a git repository")
+
     _spinner = Spinner()
     try:
         _spinner.set("Staging changes...")
