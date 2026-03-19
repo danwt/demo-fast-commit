@@ -521,6 +521,18 @@ def is_echoing_keys(commit):
     return False
 
 
+_VALID_TYPES = {"feat", "fix", "refactor", "chore", "docs", "style", "test", "perf"}
+
+
+def _clean_commit_message(message):
+    """Clean up LLM-generated commit message for quality."""
+    message = message.strip().rstrip(".")
+    # Truncate to 72 chars (git convention for subject line)
+    if len(message) > 72:
+        message = message[:69] + "..."
+    return message
+
+
 def validate_and_fix_commits(commits, staged_files):
     """Validate LLM output and fix issues.
 
@@ -555,7 +567,7 @@ def validate_and_fix_commits(commits, staged_files):
         covered_files.update(normalized)
         fixed_commits.append({
             "files": normalized,
-            "message": commit["message"],
+            "message": _clean_commit_message(commit["message"]),
             "description": commit.get("description", ""),
         })
 
@@ -1163,10 +1175,10 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
             message = f"chore: update {len(normalized)} files"
 
         description = result.get("description", "")
-        if description.lower() in ("description", "desc"):
+        if description.lower() == "description":
             description = ""
 
-        commits.append({"files": normalized, "message": message, "description": description})
+        commits.append({"files": normalized, "message": _clean_commit_message(message), "description": description})
 
     return commits
 

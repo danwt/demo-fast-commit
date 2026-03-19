@@ -23,6 +23,7 @@ extract_diff_path = _mod.extract_diff_path
 try_repair_json = _mod.try_repair_json
 normalize_llm_files = _mod.normalize_llm_files
 is_echoing_keys = _mod.is_echoing_keys
+_clean_commit_message = _mod._clean_commit_message
 validate_and_fix_commits = _mod.validate_and_fix_commits
 detect_directory_moves = _mod.detect_directory_moves
 normalize_llm_result = _mod.normalize_llm_result
@@ -496,3 +497,35 @@ class TestEdgeCases:
         r1 = set(normalize_llm_files(["b.py", "a.py"], staged))
         r2 = set(normalize_llm_files(["a.py", "b.py"], staged))
         assert r1 == r2
+
+
+# ---------------------------------------------------------------------------
+# _clean_commit_message
+# ---------------------------------------------------------------------------
+
+class TestCleanCommitMessage:
+    def test_strips_trailing_period(self):
+        assert _clean_commit_message("feat: add thing.") == "feat: add thing"
+
+    def test_strips_whitespace(self):
+        assert _clean_commit_message("  fix: a  ") == "fix: a"
+
+    def test_truncates_long_message(self):
+        long_msg = "feat(scope): " + "x" * 100
+        result = _clean_commit_message(long_msg)
+        assert len(result) <= 72
+        assert result.endswith("...")
+
+    def test_preserves_short_message(self):
+        msg = "fix(auth): correct token validation"
+        assert _clean_commit_message(msg) == msg
+
+    def test_exactly_72_chars_not_truncated(self):
+        msg = "x" * 72
+        assert _clean_commit_message(msg) == msg
+
+    def test_73_chars_truncated(self):
+        msg = "x" * 73
+        result = _clean_commit_message(msg)
+        assert len(result) == 72
+        assert result.endswith("...")
