@@ -354,12 +354,12 @@ def run(cmd, check=False, timeout=60):
     return stdout, stderr, result.returncode
 
 
+_PATHSPEC_EXCLUDES = [":(exclude)**/" + p for p in EXCLUDED_PATTERNS]
+
+
 def build_pathspec_excludes():
     """Build git pathspec exclude args for lockfiles etc."""
-    excludes = []
-    for pattern in EXCLUDED_PATTERNS:
-        excludes.append(":(exclude)**/" + pattern)
-    return excludes
+    return _PATHSPEC_EXCLUDES
 
 
 def _top(path):
@@ -368,18 +368,15 @@ def _top(path):
     return f":(top){path}"
 
 
+_DIFF_NOISE_PREFIXES = ("index ", "similarity index ", "dissimilarity index ")
+
+
 def strip_diff_noise(diff):
     """Remove noise lines from diff to save tokens."""
-    lines = []
-    for line in diff.splitlines():
-        if line.startswith("index "):
-            continue
-        if line.startswith("similarity index "):
-            continue
-        if line.startswith("dissimilarity index "):
-            continue
-        lines.append(line)
-    return "\n".join(lines)
+    return "\n".join(
+        line for line in diff.splitlines()
+        if not line.startswith(_DIFF_NOISE_PREFIXES)
+    )
 
 
 def get_diff():
@@ -446,15 +443,16 @@ def extract_diff_path(header):
     return ""
 
 
+_LOCKFILE_SUFFIXES = tuple(p[1:] for p in EXCLUDED_PATTERNS if p.startswith("*"))
+_LOCKFILE_NAMES = frozenset(p for p in EXCLUDED_PATTERNS if not p.startswith("*"))
+
+
 def is_lockfile(path):
     """Check if a file path matches any lockfile pattern."""
-    for pattern in EXCLUDED_PATTERNS:
-        if pattern.startswith("*"):
-            if path.endswith(pattern[1:]):
-                return True
-        elif path.endswith("/" + pattern) or path == pattern:
-            return True
-    return False
+    basename = path.rsplit("/", 1)[-1]
+    if basename in _LOCKFILE_NAMES:
+        return True
+    return path.endswith(_LOCKFILE_SUFFIXES)
 
 
 def git_unquote(path):
@@ -668,7 +666,8 @@ def compress_diff(diff, max_chars=None):
     total_chars = 0
     files_truncated = 0
 
-    for file_header, lines in file_sections:
+    n_files = len(file_sections)
+    for file_idx, (file_header, lines) in enumerate(file_sections):
         if total_chars >= remaining:
             files_truncated += 1
             continue
@@ -683,11 +682,8 @@ def compress_diff(diff, max_chars=None):
             total_chars += len(summary)
             continue
 
-        # Compress this file's diff with per-file budget
-        per_file_budget = min(
-            remaining - total_chars,
-            remaining // max(len(file_sections), 1),
-        )
+        files_left = n_files - file_idx
+        per_file_budget = (remaining - total_chars) // max(files_left, 1)
 
         file_parts = [file_header]
         file_chars = len(file_header)
@@ -1412,22 +1408,42 @@ def main():
         short_msg = message if len(message) <= 45 else message[:42] + "..."
         _spinner.set(f"Committing {idx}/{total}: {short_msg}")
 
+        deleted = [f for f in files if is_file_deleted(f, staged_files)]
+        to_add = [f for f in files if not is_file_deleted(f, staged_files)]
         added_files = []
-        for f in files:
-            if is_file_deleted(f, staged_files):
-                _, stderr, code = run(["git", "rm", "--cached", "--", _top(f)])
-            else:
-                _, stderr, code = run(["git", "add", "--", _top(f)])
-                if code != 0 and "ignored" in stderr.lower():
-                    _, stderr, code = run(["git", "add", "-f", "--", _top(f)])
-                info = staged_files.get(f, {})
-                old_path = info.get("old", f)
-                if code == 0 and old_path != f:
-                    run(["git", "rm", "--cached", "--", _top(old_path)])
+
+        if to_add:
+            _, stderr, code = run(["git", "add", "--"] + [_top(f) for f in to_add])
             if code == 0:
-                added_files.append(f)
+                added_files.extend(to_add)
+                old_paths = [_top(staged_files[f]["old"]) for f in to_add
+                             if staged_files.get(f, {}).get("old", f) != f]
+                if old_paths:
+                    run(["git", "rm", "--cached", "--"] + old_paths)
             else:
-                warn(f"could not stage {f}: {stderr.strip()}")
+                for f in to_add:
+                    _, stderr2, code2 = run(["git", "add", "--", _top(f)])
+                    if code2 != 0 and "ignored" in stderr2.lower():
+                        _, stderr2, code2 = run(["git", "add", "-f", "--", _top(f)])
+                    if code2 == 0:
+                        added_files.append(f)
+                        old_path = staged_files.get(f, {}).get("old", f)
+                        if old_path != f:
+                            run(["git", "rm", "--cached", "--", _top(old_path)])
+                    else:
+                        warn(f"could not stage {f}: {stderr2.strip()}")
+
+        if deleted:
+            _, stderr, code = run(["git", "rm", "--cached", "--"] + [_top(f) for f in deleted])
+            if code == 0:
+                added_files.extend(deleted)
+            else:
+                for f in deleted:
+                    _, stderr2, code2 = run(["git", "rm", "--cached", "--", _top(f)])
+                    if code2 == 0:
+                        added_files.append(f)
+                    else:
+                        warn(f"could not stage {f}: {stderr2.strip()}")
 
         skipped_files = [f for f in files if f not in added_files]
         if skipped_files:
