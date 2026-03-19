@@ -30,6 +30,9 @@ normalize_llm_result = _mod.normalize_llm_result
 is_malformed_response = _mod.is_malformed_response
 compress_diff = _mod.compress_diff
 BINARY_EXTENSIONS = _mod.BINARY_EXTENSIONS
+summarize_file_operations = _mod.summarize_file_operations
+group_files_by_directory = _mod.group_files_by_directory
+is_file_deleted = _mod.is_file_deleted
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +532,86 @@ class TestCleanCommitMessage:
         result = _clean_commit_message(msg)
         assert len(result) == 72
         assert result.endswith("...")
+
+
+# ---------------------------------------------------------------------------
+# summarize_file_operations
+# ---------------------------------------------------------------------------
+
+class TestSummarizeFileOperations:
+    def test_bulk_deletes_grouped(self):
+        staged = {
+            "old/a.py": {"old": "old/a.py", "deleted": True},
+            "old/b.py": {"old": "old/b.py", "deleted": True},
+            "old/c.py": {"old": "old/c.py", "deleted": True},
+        }
+        ops = summarize_file_operations(staged)
+        assert len(ops) == 1
+        assert "remove" in ops[0]["message"]
+
+    def test_single_change(self):
+        staged = {
+            "src/main.py": {"old": "src/main.py", "deleted": False},
+        }
+        ops = summarize_file_operations(staged)
+        assert len(ops) == 1
+        assert ops[0]["files"] == ["src/main.py"]
+
+    def test_mixed_operations(self):
+        staged = {
+            "src/a.py": {"old": "src/a.py", "deleted": False},
+            "old/b.py": {"old": "old/b.py", "deleted": True},
+        }
+        ops = summarize_file_operations(staged)
+        assert len(ops) == 2
+
+    def test_empty_staged(self):
+        ops = summarize_file_operations({})
+        assert ops == []
+
+
+# ---------------------------------------------------------------------------
+# group_files_by_directory
+# ---------------------------------------------------------------------------
+
+class TestGroupFilesByDirectory:
+    def test_returns_operations_when_available(self):
+        staged = {
+            "old/a.py": {"old": "old/a.py", "deleted": True},
+            "old/b.py": {"old": "old/b.py", "deleted": True},
+            "old/c.py": {"old": "old/c.py", "deleted": True},
+        }
+        groups = group_files_by_directory(staged)
+        assert len(groups) >= 1
+        all_files = set()
+        for g in groups:
+            all_files.update(g["files"])
+        assert all_files == set(staged.keys())
+
+    def test_fallback_single_group(self):
+        # When summarize returns nothing, should get a single fallback group
+        staged = {}
+        groups = group_files_by_directory(staged)
+        assert len(groups) == 1
+        assert groups[0]["message"] == "chore: update files"
+
+
+# ---------------------------------------------------------------------------
+# is_file_deleted
+# ---------------------------------------------------------------------------
+
+class TestIsFileDeleted:
+    def test_deleted_file(self):
+        staged = {"a.py": {"old": "a.py", "deleted": True}}
+        assert is_file_deleted("a.py", staged)
+
+    def test_not_deleted(self):
+        staged = {"a.py": {"old": "a.py", "deleted": False}}
+        assert not is_file_deleted("a.py", staged)
+
+    def test_missing_file(self):
+        assert not is_file_deleted("nonexistent.py", {})
+
+    def test_missing_deleted_key(self):
+        staged = {"a.py": {"old": "a.py"}}
+        assert not is_file_deleted("a.py", staged)
