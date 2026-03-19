@@ -453,8 +453,10 @@ def get_staged_files_for_commit():
         if not line:
             continue
         parts = line.split("\t")
+        if len(parts) < 2:
+            continue
         status = parts[0]
-        if status.startswith("R"):  # Rename: R100\told\tnew
+        if status.startswith("R") and len(parts) >= 3:  # Rename: R100\told\tnew
             old_path = git_unquote(parts[1])
             new_path = git_unquote(parts[2])
             if not is_lockfile(new_path):
