@@ -8,6 +8,7 @@
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -80,12 +81,29 @@ def log_git_state():
 
 
 # ---------------------------------------------------------------------------
-# Spinner + output helpers
+# Color + output helpers
 # ---------------------------------------------------------------------------
 
-TICK = "✓"
-CROSS = "✗"
-WARN_SYM = "⚠"
+_USE_COLOR = sys.stderr.isatty() and "NO_COLOR" not in os.environ
+
+
+def _c(code, text):
+    """Apply ANSI color if supported."""
+    if not _USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _green(t): return _c("32", t)
+def _red(t): return _c("31", t)
+def _yellow(t): return _c("33", t)
+def _dim(t): return _c("2", t)
+def _cyan(t): return _c("36", t)
+
+
+TICK = _green("✓")
+CROSS = _red("✗")
+WARN_SYM = _yellow("⚠")
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 _output_lock = threading.Lock()
@@ -105,7 +123,7 @@ class Spinner:
         i = 0
         while not self._stop.wait(0.08):
             with _output_lock:
-                frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+                frame = _cyan(SPINNER_FRAMES[i % len(SPINNER_FRAMES)])
                 sys.stdout.write(f"\r{frame} {self._msg}")
                 sys.stdout.flush()
             i += 1
@@ -116,7 +134,7 @@ class Spinner:
 
     def _clear(self):
         """Clear spinner line. Must be called with _output_lock held."""
-        sys.stdout.write("\r" + " " * (len(self._msg) + 4) + "\r")
+        sys.stdout.write("\r" + " " * (len(self._msg) + 20) + "\r")
         sys.stdout.flush()
 
     def println(self, message, file=sys.stdout):
@@ -1170,9 +1188,9 @@ def get_lockfiles_in_staging():
 def _fmt_files(files, limit=4):
     """Format a file list compactly for display."""
     shown = sorted(files)[:limit]
-    result = ", ".join(shown)
+    result = ", ".join(_dim(f) for f in shown)
     if len(files) > limit:
-        result += f" +{len(files) - limit} more"
+        result += _dim(f" +{len(files) - limit} more")
     return result
 
 
@@ -1187,17 +1205,17 @@ def _print_commit_plan(commits, lockfiles):
         })
 
     sprint("")
-    sprint("  Planned commits:")
-    sprint("  " + "─" * 58)
+    sprint(_dim("  Planned commits:"))
+    sprint(_dim("  " + "─" * 58))
     for i, c in enumerate(all_entries, 1):
         msg = c["message"]
         desc = c.get("description", "")
         files = c.get("files", [])
-        sprint(f"  {i:2d}  {msg}")
+        sprint(f"  {_dim(f'{i:2d}')}  {msg}")
         if desc:
-            sprint(f"       {desc}")
+            sprint(f"       {_dim(desc)}")
         sprint(f"       {_fmt_files(files)}")
-    sprint("  " + "─" * 58)
+    sprint(_dim("  " + "─" * 58))
     sprint("")
 
 
