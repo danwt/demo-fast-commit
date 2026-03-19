@@ -137,11 +137,11 @@ class Spinner:
         sys.stdout.write("\r" + " " * (len(self._msg) + 20) + "\r")
         sys.stdout.flush()
 
-    def println(self, message, file=sys.stdout):
+    def println(self, message, file=None):
         """Print a line, temporarily pausing the spinner."""
         with _output_lock:
             self._clear()
-            print(message, file=file)
+            print(message, file=file or sys.stdout)
 
     def ok(self, message):
         self.println(f"{TICK} {message}")
@@ -164,12 +164,12 @@ class Spinner:
 _spinner: "Spinner | None" = None
 
 
-def sprint(message, file=sys.stdout):
+def sprint(message, file=None):
     """Print a message, clearing the spinner line first if one is active."""
     if _spinner:
         _spinner.println(message, file=file)
     else:
-        print(message, file=file)
+        print(message, file=file or sys.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -415,16 +415,18 @@ def is_lockfile(path):
     return path.endswith(_LOCKFILE_SUFFIXES)
 
 
+_GIT_ESCAPE_MAP = {
+    '\\': ord('\\'), '"': ord('"'), 'n': ord('\n'), 't': ord('\t'),
+    'a': ord('\a'), 'b': ord('\b'), 'f': ord('\f'), 'v': ord('\v'),
+    'r': ord('\r'),
+}
+
+
 def git_unquote(path):
     """Decode git's C-style quoted path."""
     if not (path.startswith('"') and path.endswith('"')):
         return path
     inner = path[1:-1]
-    _escape_map = {
-        '\\': ord('\\'), '"': ord('"'), 'n': ord('\n'), 't': ord('\t'),
-        'a': ord('\a'), 'b': ord('\b'), 'f': ord('\f'), 'v': ord('\v'),
-        'r': ord('\r'),
-    }
     result = bytearray()
     i = 0
     while i < len(inner):
@@ -433,8 +435,8 @@ def git_unquote(path):
             if c in '01234567' and i + 3 < len(inner):
                 result.append(int(inner[i + 1:i + 4], 8))
                 i += 4
-            elif c in _escape_map:
-                result.append(_escape_map[c])
+            elif c in _GIT_ESCAPE_MAP:
+                result.append(_GIT_ESCAPE_MAP[c])
                 i += 2
             else:
                 result.extend(inner[i].encode('utf-8'))
@@ -701,7 +703,6 @@ MAX_RETRIES = 3
 
 class ContextLengthExceeded(Exception):
     """Raised when LLM context length is exceeded."""
-    pass
 
 
 def try_repair_json(content):
@@ -814,7 +815,7 @@ def call_llm_raw(config, system_prompt, user_content):
                         "Content-Type": "application/json",
                     },
                     json=request_body,
-                    timeout=60,
+                    timeout=(10, 60),
                 )
                 if resp.status_code == 200:
                     break
@@ -848,6 +849,8 @@ def call_llm_raw(config, system_prompt, user_content):
             signal.alarm(0)
             if old_alarm_handler is not None:
                 signal.signal(signal.SIGALRM, old_alarm_handler)
+    if resp is None:
+        exit_with_error("LLM request failed: no response received", {"model": config["MODEL"]})
     try:
         resp_json = resp.json()
     except json.JSONDecodeError as e:
@@ -1075,6 +1078,8 @@ def _smart_fallback_commits(normalized, staged_files):
     smart_ops = summarize_file_operations(group_staged)
     if smart_ops:
         return [{"files": op["files"], "message": op["message"], "description": op.get("description", "")} for op in smart_ops]
+    if normalized:
+        return [{"files": list(normalized), "message": "chore: update files", "description": ""}]
     return []
 
 
@@ -1466,7 +1471,7 @@ def main():
     _prune_old_logs()
 
     config = load_config()
-    log("INFO", "using model: {model}", {"model": config["MODEL"]})
+    log("INFO", "using model", {"model": config["MODEL"]})
 
     _spinner = Spinner()
     try:
@@ -1499,6 +1504,8 @@ def main():
         _print_commit_plan(commits, lockfiles)
 
         if args.dry_run:
+            if source == "all":
+                run(["git", "reset", "HEAD", "--", "."])
             audit("dry_run", {"commits": len(commits)})
             return
 
