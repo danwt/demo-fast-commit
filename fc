@@ -519,7 +519,7 @@ def is_echoing_keys(commit):
     if isinstance(message, str) and message.lower() in ("message", "", "commit message", "msg"):
         return True
 
-    if isinstance(description, str) and description.lower() in ("description", "desc"):
+    if isinstance(description, str) and description.lower() == "description":
         return True
 
     return False
