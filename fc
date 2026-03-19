@@ -8,6 +8,7 @@
 
 import argparse
 import json
+import signal
 import subprocess
 import sys
 import threading
@@ -134,6 +135,8 @@ class Spinner:
         self.println(f"{WARN_SYM} {message}", file=sys.stderr)
 
     def stop(self):
+        if self._stop.is_set():
+            return
         self._stop.set()
         self._thread.join()
         with _output_lock:
@@ -812,14 +815,12 @@ class _LLMWallClockTimeout(Exception):
     pass
 
 
+_HAS_SIGALRM = hasattr(signal, "SIGALRM")
+
+
 def call_llm_raw(config, system_prompt, user_content):
     """Make a raw LLM API call and return parsed JSON."""
-    import signal
-
     import requests
-
-    def _alarm_handler(signum, frame):
-        raise _LLMWallClockTimeout()
 
     use_structured = config.get("STRUCTURED_OUTPUT", "true").lower() == "true"
 
@@ -835,72 +836,62 @@ def call_llm_raw(config, system_prompt, user_content):
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
 
-    wall_clock_timeout = 90  # total seconds per attempt, kills chunked-transfer hangs
-    old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    wall_clock_timeout = 90
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            signal.alarm(wall_clock_timeout)
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
-                    "Content-Type": "application/json",
-                },
-                json=request_body,
-                timeout=60,
-            )
-            signal.alarm(0)
-            if resp.status_code == 200:
-                break
-            if resp.status_code == 400 and "context length" in resp.text.lower():
-                log("INFO", "LLM context length exceeded", {"response": resp.text[:300]})
-                raise ContextLengthExceeded(resp.text[:500])
-            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
-                wait_time = 2**attempt
-                warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                time.sleep(wait_time)
-                continue
-            exit_with_error(
-                f"LLM API returned {resp.status_code}",
-                {"status_code": resp.status_code, "response": resp.text[:500], "model": config["MODEL"]}
-            )
-        except _LLMWallClockTimeout:
-            signal.alarm(0)
-            if attempt < MAX_RETRIES - 1:
-                wait_time = 2**attempt
-                warn(f"LLM request exceeded {wall_clock_timeout}s wall-clock timeout, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                time.sleep(wait_time)
-                continue
-            exit_with_error(
-                f"LLM API request timed out after {MAX_RETRIES} attempts",
-                {"model": config["MODEL"], "attempts": MAX_RETRIES}
-            )
-        except requests.exceptions.Timeout:
-            signal.alarm(0)
-            if attempt < MAX_RETRIES - 1:
-                wait_time = 2**attempt
-                warn(f"LLM request timed out, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                time.sleep(wait_time)
-                continue
-            exit_with_error(
-                f"LLM API request timed out after {MAX_RETRIES} attempts",
-                {"model": config["MODEL"], "attempts": MAX_RETRIES}
-            )
-        except requests.exceptions.RequestException as e:
-            signal.alarm(0)
-            if attempt < MAX_RETRIES - 1:
-                wait_time = 2**attempt
-                warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                time.sleep(wait_time)
-                continue
-            exit_with_error(
-                f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
-                {"model": config["MODEL"], "attempts": MAX_RETRIES}
-            )
+    def _alarm_handler(signum, frame):
+        raise _LLMWallClockTimeout()
 
-    signal.alarm(0)
-    signal.signal(signal.SIGALRM, old_alarm_handler)
+    old_alarm_handler = None
+    if _HAS_SIGALRM:
+        old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+
+    resp = None
+    try:
+        for attempt in range(MAX_RETRIES):
+            try:
+                if _HAS_SIGALRM:
+                    signal.alarm(wall_clock_timeout)
+                resp = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_body,
+                    timeout=60,
+                )
+                if resp.status_code == 200:
+                    break
+                if resp.status_code == 400 and "context length" in resp.text.lower():
+                    log("INFO", "LLM context length exceeded", {"response": resp.text[:300]})
+                    raise ContextLengthExceeded(resp.text[:500])
+                if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                    wait_time = 2 ** attempt
+                    warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(wait_time)
+                    continue
+                exit_with_error(
+                    f"LLM API returned {resp.status_code}",
+                    {"status_code": resp.status_code, "response": resp.text[:500], "model": config["MODEL"]}
+                )
+            except (_LLMWallClockTimeout, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = 2 ** attempt
+                    warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(wait_time)
+                    continue
+                exit_with_error(
+                    f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
+                    {"model": config["MODEL"], "attempts": MAX_RETRIES}
+                )
+            finally:
+                if _HAS_SIGALRM:
+                    signal.alarm(0)
+    finally:
+        if _HAS_SIGALRM:
+            signal.alarm(0)
+            if old_alarm_handler is not None:
+                signal.signal(signal.SIGALRM, old_alarm_handler)
     try:
         resp_json = resp.json()
     except json.JSONDecodeError as e:
@@ -1541,4 +1532,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        if _spinner:
+            _spinner.stop()
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
