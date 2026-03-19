@@ -50,8 +50,6 @@ def log(level, message, context=None):
         f.write(line + "\n")
 
 
-MAX_STATUS_LINES_IN_LOG = 100
-
 
 def log_git_state():
     """Log current git state to session log."""
@@ -71,11 +69,7 @@ def log_git_state():
             status = status_result.stdout.decode().strip()
             if status:
                 lines = status.splitlines()
-                if len(lines) > MAX_STATUS_LINES_IN_LOG:
-                    truncated = "\n".join(lines[:MAX_STATUS_LINES_IN_LOG])
-                    log("INFO", "git status (truncated)", {"total_files": len(lines), "shown": MAX_STATUS_LINES_IN_LOG})
-                else:
-                    log("INFO", "git status", {"files": len(lines)})
+                log("INFO", "git status", {"files": len(lines)})
     except Exception as e:
         log("INFO", "git state capture failed", {"error": str(e)})
 
