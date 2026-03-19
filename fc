@@ -78,7 +78,7 @@ def log_git_state():
 # Color + output helpers
 # ---------------------------------------------------------------------------
 
-_USE_COLOR = sys.stderr.isatty() and "NO_COLOR" not in os.environ
+_USE_COLOR = sys.stdout.isatty() and sys.stderr.isatty() and "NO_COLOR" not in os.environ
 
 
 def _c(code, text):
