@@ -161,7 +161,7 @@ def warn(message, context=None):
         _spinner.warn(message)
     else:
         print(f"{WARN_SYM} {message}", file=sys.stderr)
-    log("INFO", message, context)
+    log("WARN", message, context)
 
 
 def record_error(message, context=None):
@@ -397,9 +397,6 @@ def get_diff():
         untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard", "."])
         if not untracked.strip():
             return "", "none"
-        run(["git", "add", "-A", "."], check=True)
-        diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--", "."] + excludes)
-        return strip_diff_noise(diff), "all"
     run(["git", "add", "-A", "."], check=True)
     diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--", "."] + excludes)
     return strip_diff_noise(diff), "all"
@@ -419,7 +416,7 @@ MAX_LLM_RETRIES = 3
 
 BINARY_EXTENSIONS = {
     '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
-    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.webp', '.avif',
     '.woff', '.woff2', '.ttf', '.eot', '.otf',
     '.pdf', '.doc', '.docx', '.xls', '.xlsx',
     '.exe', '.dll', '.so', '.dylib', '.o', '.a',
@@ -462,6 +459,11 @@ def git_unquote(path):
     if not (path.startswith('"') and path.endswith('"')):
         return path
     inner = path[1:-1]
+    _escape_map = {
+        '\\': ord('\\'), '"': ord('"'), 'n': ord('\n'), 't': ord('\t'),
+        'a': ord('\a'), 'b': ord('\b'), 'f': ord('\f'), 'v': ord('\v'),
+        'r': ord('\r'),
+    }
     result = bytearray()
     i = 0
     while i < len(inner):
@@ -470,17 +472,8 @@ def git_unquote(path):
             if c in '01234567' and i + 3 < len(inner):
                 result.append(int(inner[i + 1:i + 4], 8))
                 i += 4
-            elif c == '\\':
-                result.append(ord('\\'))
-                i += 2
-            elif c == '"':
-                result.append(ord('"'))
-                i += 2
-            elif c == 'n':
-                result.append(ord('\n'))
-                i += 2
-            elif c == 't':
-                result.append(ord('\t'))
+            elif c in _escape_map:
+                result.append(_escape_map[c])
                 i += 2
             else:
                 result.extend(inner[i].encode('utf-8'))
@@ -529,6 +522,9 @@ def normalize_llm_files(llm_files, staged_files):
     for f in llm_files:
         if not isinstance(f, str):
             continue
+        f = f.lstrip("/")
+        if f.startswith("a/") or f.startswith("b/"):
+            f = f[2:]
         if f in staged_files:
             normalized.add(f)
         elif f in old_to_new:
