@@ -194,10 +194,15 @@ def record_error(message, context=None):
 _audit_repo = None
 
 
+_audit_dir_created = False
+
+
 def audit(event, data=None):
     """Append a structured entry to the persistent audit log."""
-    global _audit_repo
-    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    global _audit_repo, _audit_dir_created
+    if not _audit_dir_created:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        _audit_dir_created = True
     if _audit_repo is None:
         repo_result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
