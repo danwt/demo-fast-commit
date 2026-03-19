@@ -589,11 +589,8 @@ def compress_diff(diff, max_chars=None):
 
     excludes = build_pathspec_excludes()
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--", "."] + excludes)
-    dirstat, _, _ = run(["git", "diff", "--cached", "--dirstat", "--", "."] + excludes)
 
     parts = [f"DIFF STAT:\n{stat}"]
-    if dirstat.strip():
-        parts.append(f"DIRECTORY CHANGES:\n{dirstat}")
 
     header_chars = sum(len(p) for p in parts) + 50
     remaining = max_chars - header_chars
