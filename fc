@@ -1431,6 +1431,8 @@ def main():
                 _, stderr, code = run(["git", "rm", "--cached", "--", _top(f)])
             else:
                 _, stderr, code = run(["git", "add", "--", _top(f)])
+                if code != 0 and "ignored" in stderr.lower():
+                    _, stderr, code = run(["git", "add", "-f", "--", _top(f)])
                 info = staged_files.get(f, {})
                 old_path = info.get("old", f)
                 if code == 0 and old_path != f:
