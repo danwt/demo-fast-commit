@@ -60,7 +60,7 @@ def log_git_state():
             capture_output=True, timeout=5
         )
         branch = branch_result.stdout.decode().strip() if branch_result.returncode == 0 else "unknown"
-        log("INFO", f"git branch: {branch}")
+        log("INFO", "git branch", {"branch": branch})
 
         status_result = subprocess.run(
             ["git", "status", "--short"],
@@ -72,11 +72,11 @@ def log_git_state():
                 lines = status.splitlines()
                 if len(lines) > MAX_STATUS_LINES_IN_LOG:
                     truncated = "\n".join(lines[:MAX_STATUS_LINES_IN_LOG])
-                    log("INFO", f"git status (truncated, {len(lines)} files total):\n{truncated}\n... and {len(lines) - MAX_STATUS_LINES_IN_LOG} more")
+                    log("INFO", "git status (truncated)", {"total_files": len(lines), "shown": MAX_STATUS_LINES_IN_LOG})
                 else:
-                    log("INFO", f"git status:\n{status}")
+                    log("INFO", "git status", {"files": len(lines)})
     except Exception as e:
-        log("INFO", f"failed to capture git state: {e}")
+        log("INFO", "git state capture failed", {"error": str(e)})
 
 
 # ---------------------------------------------------------------------------
@@ -1123,7 +1123,7 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
         if not group_diff.strip():
             continue
         content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
-        log("INFO", f"phase 2 group {i + 1}: sending diff to LLM", {"chars": len(content), "files": len(normalized)})
+        log("INFO", "phase 2: sending diff to LLM", {"group": i + 1, "chars": len(content), "files": len(normalized)})
 
         try:
             result = call_llm_raw(config, PHASE2_PROMPT, content)
@@ -1221,115 +1221,106 @@ def _prune_old_logs():
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — extracted phases
 # ---------------------------------------------------------------------------
 
-def main():
-    global _spinner
-
-    parser = argparse.ArgumentParser(description="Fast commit with LLM-generated messages")
-    parser.add_argument("--no-verify", action="store_true", help="bypass pre-commit hooks")
-    parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
-    parser.add_argument("--no-push", action="store_true", help="skip automatic push")
-    parser.add_argument("--bulk", action="store_true", help="skip LLM, use smart file tree analysis (for large batches)")
-    args = parser.parse_args()
-
-    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk})
-    log_git_state()
-    _prune_old_logs()
-
-    config = load_config()
-    log("INFO", f"using model: {config['MODEL']}")
-
-    _spinner = Spinner()
-
-    # --- Stage & collect ---
-    _spinner.set("Staging changes...")
-    diff, source = get_diff()
-    if not diff:
-        _spinner.stop()
-        sprint("nothing to commit")
-        return
-
-    staged_files = get_staged_files_for_commit()
+def generate_commit_plan(config, args, diff, staged_files):
+    """Generate commit plan via LLM or bulk analysis. Returns list of commits."""
     file_count = len(staged_files)
 
-    if file_count == 0:
-        _spinner.stop()
-        sprint("nothing to commit")
-        return
-
-    lockfiles = get_lockfiles_in_staging()
-    _spinner.ok(f"Staged {file_count} file{'s' if file_count != 1 else ''}")
-
-    audit("start", {
-        "source": source,
-        "file_count": file_count,
-        "files": sorted(staged_files.keys()),
-        "lockfiles": lockfiles,
-    })
-
-    # --- Generate commit plan ---
     if args.bulk or file_count > BULK_FILE_THRESHOLD:
         mode = "--bulk flag" if args.bulk else f"{file_count} files"
         _spinner.set(f"Grouping files ({mode})...")
         commits = group_files_by_directory(staged_files)
         _spinner.ok(f"Planned {len(commits)} commit{'s' if len(commits) != 1 else ''} (bulk)")
-    else:
-        missing_hint = None
-        commits = None
+        return commits
 
-        for attempt in range(1, MAX_LLM_RETRIES + 1):
-            if file_count > LARGE_DIFF_FILES:
-                _spinner.set("Grouping files...")
-                raw_commits = call_llm_two_phase(config, staged_files, missing_hint=missing_hint)
-            else:
-                label = f"Analysing {file_count} files"
-                if attempt > 1:
-                    label += f" (retry {attempt}/{MAX_LLM_RETRIES})"
-                _spinner.set(f"{label}...")
-                try:
-                    raw_commits = call_llm(config, diff, missing_hint=missing_hint)
-                except ContextLengthExceeded:
-                    warn("diff too large, using bulk mode")
-                    commits = group_files_by_directory(staged_files)
-                    break
+    missing_hint = None
+    commits = None
 
-            commits, missing = validate_and_fix_commits(raw_commits, staged_files)
+    for attempt in range(1, MAX_LLM_RETRIES + 1):
+        if file_count > LARGE_DIFF_FILES:
+            _spinner.set("Grouping files...")
+            raw_commits = call_llm_two_phase(config, staged_files, missing_hint=missing_hint)
+        else:
+            label = f"Analysing {file_count} files"
+            if attempt > 1:
+                label += f" (retry {attempt}/{MAX_LLM_RETRIES})"
+            _spinner.set(f"{label}...")
+            try:
+                raw_commits = call_llm(config, diff, missing_hint=missing_hint)
+            except ContextLengthExceeded:
+                warn("diff too large, using bulk mode")
+                return group_files_by_directory(staged_files)
 
-            if not missing:
-                break
+        commits, missing = validate_and_fix_commits(raw_commits, staged_files)
 
-            log("INFO", f"LLM missed files on attempt {attempt}", {"missed": sorted(missing)})
+        if not missing:
+            break
 
-            if attempt < MAX_LLM_RETRIES:
-                missing_hint = missing
-                warn(f"LLM missed {len(missing)} file(s), retrying ({attempt}/{MAX_LLM_RETRIES})...")
-            else:
-                warn(f"LLM missed files after {MAX_LLM_RETRIES} attempts, falling back to bulk mode")
-                log("INFO", "falling back to bulk mode after LLM retry exhaustion", {"missed": sorted(missing)})
-                commits = group_files_by_directory(staged_files)
-                break
+        log("INFO", "LLM missed files", {"attempt": attempt, "missed": sorted(missing)})
 
-        n = len(commits)
-        _spinner.ok(f"Planned {n} commit{'s' if n != 1 else ''}")
+        if attempt < MAX_LLM_RETRIES:
+            missing_hint = missing
+            warn(f"LLM missed {len(missing)} file(s), retrying ({attempt}/{MAX_LLM_RETRIES})...")
+        else:
+            warn(f"LLM missed files after {MAX_LLM_RETRIES} attempts, falling back to bulk mode")
+            log("INFO", "falling back to bulk mode after LLM retry exhaustion", {"missed": sorted(missing)})
+            return group_files_by_directory(staged_files)
 
-    if not commits:
-        _spinner.stop()
-        exit_with_error("no valid commits generated", {"file_count": file_count})
+    n = len(commits)
+    _spinner.ok(f"Planned {n} commit{'s' if n != 1 else ''}")
+    return commits
 
-    _print_commit_plan(commits, lockfiles)
 
-    if args.dry_run:
-        _spinner.stop()
-        audit("dry_run", {"commits": len(commits)})
-        return
+def stage_files_for_commit(files, staged_files):
+    """Stage files for a single commit. Returns list of successfully staged paths."""
+    deleted = [f for f in files if is_file_deleted(f, staged_files)]
+    to_add = [f for f in files if not is_file_deleted(f, staged_files)]
+    added_files = []
 
-    # --- Execute commits ---
+    if to_add:
+        _, stderr, code = run(["git", "add", "--"] + [_top(f) for f in to_add])
+        if code == 0:
+            added_files.extend(to_add)
+            old_paths = [_top(staged_files[f]["old"]) for f in to_add
+                         if staged_files.get(f, {}).get("old", f) != f]
+            if old_paths:
+                run(["git", "rm", "--cached", "--"] + old_paths)
+        else:
+            for f in to_add:
+                _, stderr2, code2 = run(["git", "add", "--", _top(f)])
+                if code2 != 0 and "ignored" in stderr2.lower():
+                    _, stderr2, code2 = run(["git", "add", "-f", "--", _top(f)])
+                if code2 == 0:
+                    added_files.append(f)
+                    old_path = staged_files.get(f, {}).get("old", f)
+                    if old_path != f:
+                        run(["git", "rm", "--cached", "--", _top(old_path)])
+                else:
+                    warn(f"could not stage {f}: {stderr2.strip()}")
+
+    if deleted:
+        _, stderr, code = run(["git", "rm", "--cached", "--"] + [_top(f) for f in deleted])
+        if code == 0:
+            added_files.extend(deleted)
+        else:
+            for f in deleted:
+                _, stderr2, code2 = run(["git", "rm", "--cached", "--", _top(f)])
+                if code2 == 0:
+                    added_files.append(f)
+                else:
+                    warn(f"could not stage {f}: {stderr2.strip()}")
+
+    return added_files
+
+
+def execute_commits(commits, lockfiles, staged_files, no_verify):
+    """Execute the commit plan. Returns list of failed commit messages."""
     run(["git", "reset", "HEAD", "--", "."], check=True)
 
     commit_args = ["git", "commit"]
-    if args.no_verify:
+    if no_verify:
         commit_args.append("--no-verify")
 
     failed_commits = []
@@ -1343,42 +1334,7 @@ def main():
         short_msg = message if len(message) <= 45 else message[:42] + "..."
         _spinner.set(f"Committing {idx}/{total}: {short_msg}")
 
-        deleted = [f for f in files if is_file_deleted(f, staged_files)]
-        to_add = [f for f in files if not is_file_deleted(f, staged_files)]
-        added_files = []
-
-        if to_add:
-            _, stderr, code = run(["git", "add", "--"] + [_top(f) for f in to_add])
-            if code == 0:
-                added_files.extend(to_add)
-                old_paths = [_top(staged_files[f]["old"]) for f in to_add
-                             if staged_files.get(f, {}).get("old", f) != f]
-                if old_paths:
-                    run(["git", "rm", "--cached", "--"] + old_paths)
-            else:
-                for f in to_add:
-                    _, stderr2, code2 = run(["git", "add", "--", _top(f)])
-                    if code2 != 0 and "ignored" in stderr2.lower():
-                        _, stderr2, code2 = run(["git", "add", "-f", "--", _top(f)])
-                    if code2 == 0:
-                        added_files.append(f)
-                        old_path = staged_files.get(f, {}).get("old", f)
-                        if old_path != f:
-                            run(["git", "rm", "--cached", "--", _top(old_path)])
-                    else:
-                        warn(f"could not stage {f}: {stderr2.strip()}")
-
-        if deleted:
-            _, stderr, code = run(["git", "rm", "--cached", "--"] + [_top(f) for f in deleted])
-            if code == 0:
-                added_files.extend(deleted)
-            else:
-                for f in deleted:
-                    _, stderr2, code2 = run(["git", "rm", "--cached", "--", _top(f)])
-                    if code2 == 0:
-                        added_files.append(f)
-                    else:
-                        warn(f"could not stage {f}: {stderr2.strip()}")
+        added_files = stage_files_for_commit(files, staged_files)
 
         skipped_files = [f for f in files if f not in added_files]
         if skipped_files:
@@ -1412,10 +1368,9 @@ def main():
             continue
 
         audit("commit_ok", {"message": message, "files": added_files})
-        log("INFO", f"committed: {message}", {"files": len(added_files)})
+        log("INFO", "committed", {"message": message, "files": len(added_files)})
         _spinner.ok(message)
 
-    # Commit lockfiles separately
     if lockfiles:
         _spinner.set("Committing lockfiles...")
         run(["git", "add", "--"] + [_top(f) for f in lockfiles], check=True)
@@ -1435,10 +1390,11 @@ def main():
             log("INFO", "committed lockfiles", {"count": len(lockfiles)})
             _spinner.ok("chore: update lockfiles")
 
-    if failed_commits:
-        warn(f"{len(failed_commits)} commit(s) failed: {', '.join(failed_commits)}")
+    return failed_commits
 
-    # Audit remaining changes
+
+def audit_remaining(staged_files, lockfiles, failed_commits):
+    """Check for files that should have been committed but weren't."""
     remaining_staged, _, _ = run(["git", "diff", "--cached", "--name-only", "--", "."])
     remaining_unstaged, _, _ = run(["git", "diff", "--name-only", "--", "."])
     remaining_untracked, _, _ = run(["git", "ls-files", "--others", "--exclude-standard", "."])
@@ -1456,11 +1412,9 @@ def main():
     if missed_from_run:
         warn(f"{len(missed_from_run)} files from this run still uncommitted (check ~/.fastc/audit.jsonl)")
 
-    if args.no_push:
-        _spinner.stop()
-        sprint("done (push skipped)")
-        return
 
+def push_to_remote():
+    """Push commits to remote."""
     _spinner.set("Pushing...")
     _, stderr, code = run(["git", "push"], timeout=120)
     if code != 0:
@@ -1475,11 +1429,76 @@ def main():
                 {"stderr": stderr}
             )
         exit_with_error("push failed", {"stderr": stderr})
-
     log("INFO", "pushed to remote")
-    log("INFO", "session completed successfully")
     _spinner.ok("Pushed")
-    _spinner.stop()
+
+
+def main():
+    global _spinner
+
+    parser = argparse.ArgumentParser(description="Fast commit with LLM-generated messages")
+    parser.add_argument("--no-verify", action="store_true", help="bypass pre-commit hooks")
+    parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
+    parser.add_argument("--no-push", action="store_true", help="skip automatic push")
+    parser.add_argument("--bulk", action="store_true", help="skip LLM, use smart file tree analysis (for large batches)")
+    args = parser.parse_args()
+
+    log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk})
+    log_git_state()
+    _prune_old_logs()
+
+    config = load_config()
+    log("INFO", "using model: {model}", {"model": config["MODEL"]})
+
+    _spinner = Spinner()
+    try:
+        _spinner.set("Staging changes...")
+        diff, source = get_diff()
+        if not diff:
+            sprint("nothing to commit")
+            return
+
+        staged_files = get_staged_files_for_commit()
+        if not staged_files:
+            sprint("nothing to commit")
+            return
+
+        lockfiles = get_lockfiles_in_staging()
+        file_count = len(staged_files)
+        _spinner.ok(f"Staged {file_count} file{'s' if file_count != 1 else ''}")
+
+        audit("start", {
+            "source": source,
+            "file_count": file_count,
+            "files": sorted(staged_files.keys()),
+            "lockfiles": lockfiles,
+        })
+
+        commits = generate_commit_plan(config, args, diff, staged_files)
+        if not commits:
+            exit_with_error("no valid commits generated", {"file_count": file_count})
+
+        _print_commit_plan(commits, lockfiles)
+
+        if args.dry_run:
+            audit("dry_run", {"commits": len(commits)})
+            return
+
+        failed_commits = execute_commits(commits, lockfiles, staged_files, args.no_verify)
+
+        if failed_commits:
+            warn(f"{len(failed_commits)} commit(s) failed: {', '.join(failed_commits)}")
+
+        audit_remaining(staged_files, lockfiles, failed_commits)
+
+        if args.no_push:
+            sprint("done (push skipped)")
+            return
+
+        push_to_remote()
+        log("INFO", "session completed successfully")
+    finally:
+        _spinner.stop()
 
 
 if __name__ == "__main__":
