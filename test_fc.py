@@ -33,6 +33,10 @@ BINARY_EXTENSIONS = _mod.BINARY_EXTENSIONS
 summarize_file_operations = _mod.summarize_file_operations
 group_files_by_directory = _mod.group_files_by_directory
 is_file_deleted = _mod.is_file_deleted
+_dir_scope = _mod._dir_scope
+_smart_path_label = _mod._smart_path_label
+compute_path_context = _mod.compute_path_context
+_ensure_grounded_scope = _mod._ensure_grounded_scope
 
 
 # ---------------------------------------------------------------------------
@@ -615,3 +619,122 @@ class TestIsFileDeleted:
     def test_missing_deleted_key(self):
         staged = {"a.py": {"old": "a.py"}}
         assert not is_file_deleted("a.py", staged)
+
+
+# ---------------------------------------------------------------------------
+# _dir_scope
+# ---------------------------------------------------------------------------
+
+class TestDirScope:
+    def test_monorepo_container_dir(self):
+        assert _dir_scope("apps/grupeta/src/auth.ts") == "grupeta"
+
+    def test_packages_container(self):
+        assert _dir_scope("packages/shared/utils.ts") == "shared"
+
+    def test_non_container_dir(self):
+        assert _dir_scope("src/api/handler.go") == "src"
+
+    def test_single_dir(self):
+        assert _dir_scope("src/main.py") == "src"
+
+    def test_root_file(self):
+        assert _dir_scope("README.md") == ""
+
+    def test_libs_container(self):
+        assert _dir_scope("libs/core/index.ts") == "core"
+
+    def test_crates_container(self):
+        assert _dir_scope("crates/specl-eval/src/lib.rs") == "specl-eval"
+
+    def test_tools_container(self):
+        assert _dir_scope("tools/fastc/fc") == "fastc"
+
+
+# ---------------------------------------------------------------------------
+# _smart_path_label
+# ---------------------------------------------------------------------------
+
+class TestSmartPathLabel:
+    def test_monorepo_deep_path(self):
+        assert _smart_path_label("apps/grupeta/src/api/auth.ts") == "grupeta/auth.ts"
+
+    def test_short_path_unchanged(self):
+        assert _smart_path_label("src/main.py") == "src/main.py"
+
+    def test_root_file(self):
+        assert _smart_path_label("README.md") == "README.md"
+
+    def test_non_container_deep_path(self):
+        assert _smart_path_label("src/api/routes/handler.go") == "src/handler.go"
+
+    def test_packages_deep_path(self):
+        assert _smart_path_label("packages/shared/src/utils/format.ts") == "shared/format.ts"
+
+
+# ---------------------------------------------------------------------------
+# compute_path_context
+# ---------------------------------------------------------------------------
+
+class TestComputePathContext:
+    def test_single_project(self):
+        ctx = compute_path_context(["apps/grupeta/src/a.ts", "apps/grupeta/src/b.ts"])
+        assert "grupeta" in ctx
+        assert "PATH CONTEXT" in ctx
+
+    def test_multi_project(self):
+        ctx = compute_path_context(["apps/grupeta/a.ts", "packages/shared/b.ts"])
+        assert "grupeta" in ctx
+        assert "shared" in ctx
+
+    def test_empty_paths(self):
+        assert compute_path_context([]) == ""
+
+    def test_root_only_files(self):
+        ctx = compute_path_context(["README.md", "package.json"])
+        assert ctx == ""
+
+    def test_non_container_paths(self):
+        ctx = compute_path_context(["src/api/a.go", "src/api/b.go"])
+        assert "src" in ctx
+
+
+# ---------------------------------------------------------------------------
+# _ensure_grounded_scope
+# ---------------------------------------------------------------------------
+
+class TestEnsureGroundedScope:
+    def test_adds_scope_when_missing(self):
+        commit = {"files": ["apps/grupeta/src/auth.ts"], "message": "feat: add auth"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "feat(grupeta): add auth"
+
+    def test_preserves_existing_scope(self):
+        commit = {"files": ["apps/grupeta/src/auth.ts"], "message": "feat(auth): add validation"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "feat(auth): add validation"
+
+    def test_no_scope_for_mixed_projects(self):
+        commit = {"files": ["apps/grupeta/a.ts", "apps/other/b.ts"], "message": "chore: update deps"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "chore: update deps"
+
+    def test_scope_from_non_container(self):
+        commit = {"files": ["src/api/handler.go", "src/api/routes.go"], "message": "fix: handle errors"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "fix(src): handle errors"
+
+    def test_no_files(self):
+        commit = {"files": [], "message": "chore: update"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "chore: update"
+
+    def test_root_files_no_scope(self):
+        commit = {"files": ["README.md"], "message": "docs: update readme"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "docs: update readme"
+
+    def test_non_conventional_message_unchanged(self):
+        commit = {"files": ["apps/grupeta/a.ts"], "message": "WIP stuff"}
+        result = _ensure_grounded_scope(commit)
+        assert result["message"] == "WIP stuff"

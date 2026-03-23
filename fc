@@ -9,6 +9,7 @@
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -256,19 +257,94 @@ EXCLUDED_PATTERNS = [
     "*.map",
 ]
 
-SYSTEM_PROMPT = """Group git diff into atomic commits. Every file MUST appear in exactly one commit.
-Output JSON array: [{"files":["path/to/file"],"message":"type(scope): subject","description":"why"}]
+SCOPE_GUIDANCE = (
+    "Scope MUST reflect the project or module, NOT the leaf filename. "
+    "Derive it from the file paths: in monorepos where top-level dirs are containers "
+    "(apps/, packages/, libs/, services/, crates/, cmd/, tools/), use the project name "
+    "(2nd path component) as scope. Otherwise use the first meaningful directory. "
+    "Examples: apps/grupeta/src/auth.ts -> (grupeta), packages/shared/utils.ts -> (shared), "
+    "src/api/handler.go -> (api), infra/terraform/main.tf -> (infra). "
+    "For mixed projects, pick the most specific common ancestor. "
+    "Always include a scope — omit only for truly root-level config files."
+)
+
+SYSTEM_PROMPT = f"""Group git diff into atomic commits. Every file MUST appear in exactly one commit.
+Output JSON array: [{{"files":["path/to/file"],"message":"type(scope): subject","description":"why"}}]
 Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
+{SCOPE_GUIDANCE}
 Use REAL file paths from the diff and REAL commit messages. Output ONLY valid JSON, no markdown."""
 
 PHASE1_PROMPT = """Group changed files into logical atomic commits by analyzing file paths and change types.
 Output JSON array: [{"files":["path/to/file"],"hint":"what changed"}]
 Use REAL file paths from the list below. Output ONLY valid JSON, no markdown."""
 
-PHASE2_PROMPT = """Generate ONE commit message for this diff.
-Output JSON object: {"message":"type(scope): subject","description":"why"}
+PHASE2_PROMPT = f"""Generate ONE commit message for this diff.
+Output JSON object: {{"message":"type(scope): subject","description":"why"}}
 Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
+{SCOPE_GUIDANCE}
 Output ONLY valid JSON, no markdown."""
+
+# Directories that are monorepo containers — scope should be the child (project name)
+CONTAINER_DIRS = {"apps", "packages", "libs", "services", "crates", "cmd", "tools"}
+
+
+def _dir_scope(path):
+    """Extract monorepo-aware scope from a file path.
+
+    In monorepos where the first directory is a container (apps/, packages/, etc.),
+    the scope is the project name (2nd component). Otherwise it's the first directory.
+    """
+    parts = path.split("/")
+    if len(parts) > 2 and parts[0] in CONTAINER_DIRS:
+        return parts[1]
+    if len(parts) > 1:
+        return parts[0]
+    return ""
+
+
+def _smart_path_label(path):
+    """Return a grounded label for a file path, suitable for commit messages.
+
+    Instead of just the leaf filename, includes enough path context to be meaningful.
+    """
+    parts = path.split("/")
+    if len(parts) <= 2:
+        return path
+    if parts[0] in CONTAINER_DIRS and len(parts) > 2:
+        return f"{parts[1]}/{parts[-1]}"
+    return f"{parts[0]}/{parts[-1]}"
+
+
+def compute_path_context(file_paths):
+    """Compute a path context hint for the LLM from staged file paths.
+
+    Returns a string like:
+      PATH CONTEXT: All files under "apps/grupeta/". Projects: grupeta.
+    or for multi-project changes:
+      PATH CONTEXT: Projects: grupeta, shared. Dirs: apps/grupeta/, packages/shared/.
+    """
+    if not file_paths:
+        return ""
+    paths = list(file_paths)
+    scopes = defaultdict(set)
+    for p in paths:
+        parts = p.split("/")
+        if len(parts) > 2 and parts[0] in CONTAINER_DIRS:
+            scopes[parts[1]].add("/".join(parts[:2]))
+        elif len(parts) > 1:
+            scopes[parts[0]].add(parts[0])
+
+    if not scopes:
+        return ""
+
+    projects = sorted(scopes.keys())
+    if len(projects) == 1:
+        proj = projects[0]
+        dirs = sorted(scopes[proj])
+        return f"PATH CONTEXT: All files under \"{dirs[0]}/\". Project: {proj}.\n"
+
+    all_dirs = sorted(d for ds in scopes.values() for d in ds)
+    return f"PATH CONTEXT: Projects: {', '.join(projects)}. Dirs: {', '.join(d + '/' for d in all_dirs)}.\n"
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +621,32 @@ def _clean_commit_message(message):
     return message
 
 
+_SCOPE_RE = re.compile(r'^(\w+)(?:\(([^)]*)\))?:\s*(.*)')
+
+
+def _ensure_grounded_scope(commit):
+    """If the LLM produced a message with no scope, derive one from file paths."""
+    msg = commit.get("message", "")
+    m = _SCOPE_RE.match(msg)
+    if not m:
+        return commit
+    type_, scope, subject = m.groups()
+    if scope:
+        return commit
+    files = commit.get("files", [])
+    if not files:
+        return commit
+    scopes = set()
+    for f in files:
+        s = _dir_scope(f)
+        if s:
+            scopes.add(s)
+    if len(scopes) == 1:
+        scope = scopes.pop()
+        commit["message"] = f"{type_}({scope}): {subject}"
+    return commit
+
+
 def validate_and_fix_commits(commits, staged_files):
     """Validate LLM output and fix issues.
 
@@ -577,11 +679,12 @@ def validate_and_fix_commits(commits, staged_files):
             continue
 
         covered_files.update(normalized)
-        fixed_commits.append({
+        fixed = {
             "files": normalized,
             "message": _clean_commit_message(commit["message"]),
             "description": commit.get("description", ""),
-        })
+        }
+        fixed_commits.append(_ensure_grounded_scope(fixed))
 
     if not fixed_commits:
         # No valid commits at all - create a fallback single commit
@@ -911,9 +1014,11 @@ def call_llm_raw(config, system_prompt, user_content):
     return []
 
 
-RETRY_PROMPT = """Previous output was rejected. Use REAL file paths from the diff and REAL commit messages.
-Every file MUST appear in exactly one commit. Output ONLY valid JSON array:
-[{"files":["real/path.go"],"message":"feat(scope): real subject","description":"real reason"}]"""
+RETRY_PROMPT = f"""Previous output was rejected. Use REAL file paths from the diff and REAL commit messages.
+Every file MUST appear in exactly one commit.
+{SCOPE_GUIDANCE}
+Output ONLY valid JSON array:
+[{{"files":["real/path.go"],"message":"feat(scope): real subject","description":"real reason"}}]"""
 
 
 def is_malformed_response(result):
@@ -940,12 +1045,16 @@ def normalize_llm_result(result):
     return []
 
 
-def call_llm(config, diff, missing_hint=None):
+def call_llm(config, diff, missing_hint=None, staged_files=None):
     """Single-phase: send diff and get commits.
 
     missing_hint: set of file paths the LLM missed on a previous attempt.
+    staged_files: dict of staged file paths (used for path context).
     """
     content = diff if len(diff) <= MAX_DIFF_CHARS else compress_diff(diff)
+    path_ctx = compute_path_context(staged_files.keys()) if staged_files else ""
+    if path_ctx:
+        content = path_ctx + "\n" + content
     if missing_hint:
         hint_line = "IMPORTANT: You previously missed these files — they MUST be included: " + ", ".join(sorted(missing_hint))
         content = hint_line + "\n\n" + content
@@ -1039,35 +1148,32 @@ def summarize_file_operations(staged_files):
         else:
             op = "change"
 
-        parts = path.split("/")
-        if len(parts) > 2:
-            dir_key = "/".join(parts[:2])
-        elif len(parts) > 1:
-            dir_key = parts[0]
-        else:
-            dir_key = "root"
-
+        dir_key = _dir_scope(path) or "root"
         by_op_and_dir[op][dir_key].append(path)
 
     op_templates = [
-        ("delete",  "chore: remove {dir}/",            "chore: remove {file}",            "deleted"),
-        ("change",  "chore: update {dir}/",             "chore: update {file}",            "changed"),
-        ("rename",  "refactor: rename files in {dir}/", "refactor: rename {file}",         "renamed"),
+        ("delete",  "chore({scope}): remove {dir}/",            "chore({scope}): remove {file}",            "deleted"),
+        ("change",  "chore({scope}): update {dir}/",             "chore({scope}): update {file}",            "changed"),
+        ("rename",  "refactor({scope}): rename files in {dir}/", "refactor({scope}): rename {file}",         "renamed"),
     ]
     for op_key, bulk_tmpl, single_tmpl, verb in op_templates:
         for dir_key, files in by_op_and_dir[op_key].items():
+            scope = dir_key if dir_key != "root" else ""
             if len(files) >= 3:
+                msg = bulk_tmpl.format(scope=scope, dir=dir_key) if scope else bulk_tmpl.replace("({scope})", "").format(dir=dir_key)
                 operations.append({
                     "files": files,
-                    "message": bulk_tmpl.format(dir=dir_key),
+                    "message": msg,
                     "description": f"{len(files)} files {verb}"
                 })
                 handled_files.update(files)
             else:
                 for f in files:
+                    label = _smart_path_label(f)
+                    msg = single_tmpl.format(scope=scope, file=label) if scope else single_tmpl.replace("({scope})", "").format(file=label)
                     operations.append({
                         "files": [f],
-                        "message": single_tmpl.format(file=f.split("/")[-1]),
+                        "message": msg,
                         "description": ""
                     })
                     handled_files.add(f)
@@ -1104,7 +1210,8 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
     name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--", "."] + excludes)
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--", "."] + excludes)
 
-    phase1_content = f"FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
+    path_ctx = compute_path_context(staged_files.keys())
+    phase1_content = f"{path_ctx}FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
     if missing_hint:
         hint_line = "IMPORTANT: You previously missed these files — include ALL of them: " + ", ".join(sorted(missing_hint))
         phase1_content = hint_line + "\n\n" + phase1_content
@@ -1161,6 +1268,9 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
         if not group_diff.strip():
             continue
         content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
+        group_ctx = compute_path_context(normalized)
+        if group_ctx:
+            content = group_ctx + "\n" + content
         log("INFO", "phase 2: sending diff to LLM", {"group": i + 1, "chars": len(content), "files": len(normalized)})
 
         try:
@@ -1190,7 +1300,7 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
         if description.lower() == "description":
             description = ""
 
-        commits.append({"files": normalized, "message": _clean_commit_message(message), "description": description})
+        commits.append(_ensure_grounded_scope({"files": normalized, "message": _clean_commit_message(message), "description": description}))
 
     return commits
 
@@ -1286,7 +1396,7 @@ def generate_commit_plan(config, args, diff, staged_files):
                 label += f" (retry {attempt}/{MAX_LLM_RETRIES})"
             _spinner.set(f"{label}...")
             try:
-                raw_commits = call_llm(config, diff, missing_hint=missing_hint)
+                raw_commits = call_llm(config, diff, missing_hint=missing_hint, staged_files=staged_files)
             except ContextLengthExceeded:
                 warn("diff too large, using bulk mode")
                 return group_files_by_directory(staged_files)
