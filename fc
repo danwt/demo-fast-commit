@@ -10,7 +10,6 @@ import argparse
 import json
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -105,33 +104,130 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 _output_lock = threading.Lock()
 
 
+class Timings:
+    """Track wall-clock time per phase and aggregate LLM request stats.
+
+    Used both for live progress (in-flight count, ETA) and for the end-of-run
+    breakdown so the user can see exactly where time went.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._phases = {}         # name -> accumulated wall seconds
+        self._phase_start = {}    # name -> monotonic start
+        self._llm_total = 0.0     # sum of individual LLM durations (for parallel efficiency)
+        self._llm_count = 0
+        self._llm_inflight = 0
+        self._llm_durations = []  # rolling history for ETA
+        self._start = time.monotonic()
+
+    def phase_start(self, name):
+        with self._lock:
+            self._phase_start[name] = time.monotonic()
+
+    def phase_end(self, name):
+        with self._lock:
+            if name in self._phase_start:
+                self._phases[name] = self._phases.get(name, 0.0) + (
+                    time.monotonic() - self._phase_start.pop(name)
+                )
+
+    def request_started(self):
+        with self._lock:
+            self._llm_inflight += 1
+
+    def request_finished(self, duration):
+        with self._lock:
+            self._llm_inflight = max(0, self._llm_inflight - 1)
+            self._llm_total += duration
+            self._llm_count += 1
+            self._llm_durations.append(duration)
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "inflight": self._llm_inflight,
+                "llm_total": self._llm_total,
+                "llm_count": self._llm_count,
+                "durations": list(self._llm_durations),
+                "elapsed": time.monotonic() - self._start,
+            }
+
+    def summary_line(self):
+        with self._lock:
+            # Deterministic ordering: phases in the order we started them.
+            parts = [f"{name} {t:.1f}s" for name, t in self._phases.items()]
+            total = time.monotonic() - self._start
+            parts.append(f"total {total:.1f}s")
+            if self._llm_count:
+                parts.append(
+                    f"llm {self._llm_total:.1f}s/{self._llm_count} req"
+                )
+            return " · ".join(parts)
+
+
+_timings = Timings()
+
+
 class Spinner:
     """Thread-based terminal spinner. All output must go through this object
-    so that the spinner line is cleared before any print."""
+    so that the spinner line is cleared before any print.
+
+    Supports a dynamic message callback so phase 2 can show live progress
+    (n/N, in-flight count, ETA) without polling from the main thread.
+    """
 
     def __init__(self):
         self._msg = ""
+        self._dynamic = None
+        self._phase_start = time.monotonic()
+        self._last_line_len = 0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def _render_text(self):
+        if self._dynamic is not None:
+            try:
+                return self._dynamic()
+            except Exception:
+                return self._msg
+        return self._msg
+
     def _run(self):
         i = 0
-        while not self._stop.wait(0.08):
+        while not self._stop.wait(0.1):
             with _output_lock:
                 frame = _cyan(SPINNER_FRAMES[i % len(SPINNER_FRAMES)])
-                sys.stdout.write(f"\r{frame} {self._msg}")
+                elapsed = time.monotonic() - self._phase_start
+                body = self._render_text()
+                suffix = _dim(f" {elapsed:.1f}s")
+                line = f"{frame} {body}{suffix}"
+                # Pad over whatever we printed last frame so trailing
+                # characters from longer messages don't linger.
+                pad = max(0, self._last_line_len - len(line))
+                sys.stdout.write("\r" + line + (" " * pad))
                 sys.stdout.flush()
+                self._last_line_len = len(line)
             i += 1
 
     def set(self, message):
-        """Update the spinner message."""
+        """Update the spinner message and restart the per-phase elapsed timer."""
         self._msg = message
+        self._dynamic = None
+        self._phase_start = time.monotonic()
+
+    def set_dynamic(self, fn):
+        """Provide a callable whose return value is rendered every frame."""
+        self._dynamic = fn
+        self._phase_start = time.monotonic()
 
     def _clear(self):
         """Clear spinner line. Must be called with _output_lock held."""
-        sys.stdout.write("\r" + " " * (len(self._msg) + 20) + "\r")
-        sys.stdout.flush()
+        if self._last_line_len:
+            sys.stdout.write("\r" + " " * self._last_line_len + "\r")
+            sys.stdout.flush()
+            self._last_line_len = 0
 
     def println(self, message, file=None):
         """Print a line, temporarily pausing the spinner."""
@@ -449,8 +545,16 @@ def get_diff():
 MAX_DIFF_CHARS = 20000
 MAX_LINES_PER_HUNK = 15
 MAX_HUNKS_PER_FILE = 5
-LARGE_DIFF_FILES = 15
+# Below this many files, use the single-shot fast path (one LLM call) instead
+# of the two-phase grouping pipeline. Single-shot is dramatically faster because
+# it avoids a full round-trip before any parallel work can start.
+LARGE_DIFF_FILES = 60
 MAX_OUTPUT_TOKENS = 8192
+# Cap on concurrent phase-2 LLM requests. These are pure I/O (HTTP), so the
+# cap exists only to protect OpenRouter from a single user hammering it.
+PHASE2_MAX_PARALLEL = 32
+# Warn the user if a single LLM request takes longer than this many seconds.
+SLOW_LLM_THRESHOLD_S = 15.0
 # Beyond this many files, skip LLM entirely and use bulk commit
 BULK_FILE_THRESHOLD = 200
 # Maximum characters for phase 1 file summary before fallback
@@ -709,9 +813,41 @@ def validate_and_fix_commits(commits, staged_files):
 
 
 def get_diff_for_files(files):
-    """Get the diff for specific files only."""
+    """Get the diff for specific files only (fresh from git).
+
+    Kept for callers that don't have a parsed diff cache to hand. The
+    hot path in phase 2 uses ``slice_diff_by_file`` against an in-memory
+    cache built via ``parse_diff_by_file``.
+    """
     diff, _, _ = run(["git", "diff", "--cached", "--minimal", "--"] + [_top(f) for f in files])
     return strip_diff_noise(diff)
+
+
+def parse_diff_by_file(diff):
+    """Split a unified diff into a dict of {file_path: section_text}.
+
+    Each section includes its ``diff --git`` header so downstream code can
+    treat it as a self-contained mini-diff.
+    """
+    sections = {}
+    current_path = None
+    current_lines = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git"):
+            if current_path is not None:
+                sections[current_path] = "\n".join(current_lines)
+            current_path = extract_diff_path(line)
+            current_lines = [line]
+        elif current_path is not None:
+            current_lines.append(line)
+    if current_path is not None:
+        sections[current_path] = "\n".join(current_lines)
+    return sections
+
+
+def slice_diff_by_file(diff_by_file, files):
+    """Return a concatenated diff for ``files`` from the parsed cache."""
+    return "\n".join(diff_by_file[f] for f in files if f in diff_by_file)
 
 
 def compress_diff(diff, max_chars=None):
@@ -899,15 +1035,17 @@ class _LLMWallClockTimeout(Exception):
     pass
 
 
-_HAS_SIGALRM = hasattr(signal, "SIGALRM")
+def call_llm_raw(config, system_prompt, user_content, task_label=None):
+    """Make a streaming LLM API call and return parsed JSON.
 
-
-def call_llm_raw(config, system_prompt, user_content):
-    """Make a raw LLM API call and return parsed JSON."""
+    Streams the response over SSE so we can record TTFB, let the spinner
+    show live "receiving" progress, and warn when a single request is
+    unusually slow. ``task_label`` is used in warning messages and logs so
+    it's obvious which group is slow.
+    """
     import requests
 
     use_structured = config.get("STRUCTURED_OUTPUT", "true").lower() == "true"
-
     request_body = {
         "model": config["MODEL"],
         "messages": [
@@ -916,88 +1054,105 @@ def call_llm_raw(config, system_prompt, user_content):
         ],
         "temperature": 0,
         "max_tokens": MAX_OUTPUT_TOKENS,
+        "stream": True,
     }
     if use_structured:
         request_body["response_format"] = {"type": "json_object"}
 
     wall_clock_timeout = 90
-    is_main_thread = threading.current_thread() is threading.main_thread()
+    label = task_label or "llm"
+    content = ""
+    finish_reason = ""
 
-    def _alarm_handler(signum, frame):
-        raise _LLMWallClockTimeout()
-
-    old_alarm_handler = None
-    if _HAS_SIGALRM and is_main_thread:
-        old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-
-    resp = None
-    try:
-        for attempt in range(MAX_RETRIES):
-            try:
-                if _HAS_SIGALRM and is_main_thread:
-                    signal.alarm(wall_clock_timeout)
-                resp = requests.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
-                        "Content-Type": "application/json",
-                    },
-                    json=request_body,
-                    timeout=(10, wall_clock_timeout),
-                )
-                if resp.status_code == 200:
-                    break
-                if resp.status_code == 400 and "context length" in resp.text.lower():
-                    log("INFO", "LLM context length exceeded", {"response": resp.text[:300]})
-                    raise ContextLengthExceeded(resp.text[:500])
+    for attempt in range(MAX_RETRIES):
+        start = time.monotonic()
+        _timings.request_started()
+        resp = None
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {config['OPENROUTER_API_KEY']}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                json=request_body,
+                timeout=(10, wall_clock_timeout),
+                stream=True,
+            )
+            if resp.status_code != 200:
+                text = resp.text
+                if resp.status_code == 400 and "context length" in text.lower():
+                    _timings.request_finished(time.monotonic() - start)
+                    log("INFO", "LLM context length exceeded", {"response": text[:300]})
+                    raise ContextLengthExceeded(text[:500])
                 if resp.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                    _timings.request_finished(time.monotonic() - start)
                     wait_time = 2 ** attempt
                     warn(f"LLM API returned {resp.status_code}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
                     time.sleep(wait_time)
                     continue
+                _timings.request_finished(time.monotonic() - start)
                 exit_with_error(
                     f"LLM API returned {resp.status_code}",
-                    {"status_code": resp.status_code, "response": resp.text[:500], "model": config["MODEL"]}
+                    {"status_code": resp.status_code, "response": text[:500], "model": config["MODEL"]}
                 )
-            except (_LLMWallClockTimeout, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt
-                    warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
-                    time.sleep(wait_time)
+
+            ttfb = None
+            parts = []
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line or raw_line.startswith(":"):
                     continue
-                exit_with_error(
-                    f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
-                    {"model": config["MODEL"], "attempts": MAX_RETRIES}
-                )
-            finally:
-                if _HAS_SIGALRM and is_main_thread:
-                    signal.alarm(0)
-    finally:
-        if _HAS_SIGALRM and is_main_thread:
-            signal.alarm(0)
-            if old_alarm_handler is not None:
-                signal.signal(signal.SIGALRM, old_alarm_handler)
-    if resp is None:
-        exit_with_error("LLM request failed: no response received", {"model": config["MODEL"]})
-    try:
-        resp_json = resp.json()
-    except json.JSONDecodeError as e:
-        exit_with_error(
-            f"failed to parse API response as JSON: {e}",
-            {"response_text": resp.text[:1000], "model": config["MODEL"]}
-        )
-    try:
-        content = resp_json["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        exit_with_error(
-            f"unexpected API response structure: {e}",
-            {"response_json": str(resp_json)[:1000], "model": config["MODEL"]}
-        )
-    if content is None:
-        exit_with_error(
-            "LLM returned null content",
-            {"response_json": str(resp_json)[:1000], "model": config["MODEL"]}
-        )
+                if not raw_line.startswith("data:"):
+                    continue
+                data = raw_line[5:].lstrip()
+                if data == "[DONE]":
+                    break
+                if ttfb is None:
+                    ttfb = time.monotonic() - start
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    parts.append(piece)
+                fr = choices[0].get("finish_reason")
+                if fr:
+                    finish_reason = fr
+                if time.monotonic() - start > wall_clock_timeout:
+                    raise _LLMWallClockTimeout()
+            content = "".join(parts)
+            duration = time.monotonic() - start
+            _timings.request_finished(duration)
+            log("INFO", "llm done", {
+                "task": label,
+                "ttfb_ms": int((ttfb or duration) * 1000),
+                "duration_ms": int(duration * 1000),
+                "chars": len(content),
+            })
+            if duration >= SLOW_LLM_THRESHOLD_S:
+                warn(f"slow LLM response: {label} took {duration:.1f}s")
+            break
+        except (_LLMWallClockTimeout, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+            _timings.request_finished(time.monotonic() - start)
+            if attempt < MAX_RETRIES - 1:
+                wait_time = 2 ** attempt
+                warn(f"LLM request failed: {e}, retrying in {wait_time}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+                continue
+            exit_with_error(
+                f"LLM API request failed after {MAX_RETRIES} attempts: {e}",
+                {"model": config["MODEL"], "attempts": MAX_RETRIES}
+            )
+        finally:
+            if resp is not None:
+                resp.close()
+
     content = content.strip()
     if content.startswith("```"):
         content = "\n".join(content.split("\n")[1:])
@@ -1005,10 +1160,8 @@ def call_llm_raw(config, system_prompt, user_content):
         content = "\n".join(content.split("\n")[:-1])
     content = content.strip()
 
-    finish_reason = resp_json.get("choices", [{}])[0].get("finish_reason", "")
     if finish_reason == "length":
         warn("LLM response was truncated due to length limit")
-
     if not content:
         record_error("LLM returned empty response", {"model": config["MODEL"]})
         return []
@@ -1075,13 +1228,13 @@ def call_llm(config, diff, missing_hint=None, staged_files=None):
         hint_line = "IMPORTANT: You previously missed these files — they MUST be included: " + ", ".join(sorted(missing_hint))
         content = hint_line + "\n\n" + content
     log("INFO", "sending diff to LLM", {"chars": len(content), "compressed": len(diff) > MAX_DIFF_CHARS})
-    result = call_llm_raw(config, SYSTEM_PROMPT, content)
+    result = call_llm_raw(config, SYSTEM_PROMPT, content, task_label="single-shot")
     result = normalize_llm_result(result)
 
     if is_malformed_response(result):
         warn("response looks malformed, retrying with stronger prompt")
         retry_content = compress_diff(diff) if len(diff) > MAX_DIFF_CHARS // 2 else content
-        result = call_llm_raw(config, RETRY_PROMPT, retry_content)
+        result = call_llm_raw(config, RETRY_PROMPT, retry_content, task_label="single-shot-retry")
         result = normalize_llm_result(result)
 
     return result
@@ -1220,11 +1373,17 @@ def _smart_fallback_commits(normalized, staged_files):
     return []
 
 
-def call_llm_two_phase(config, staged_files, missing_hint=None):
-    """Two-phase approach for large diffs with many files."""
+def call_llm_two_phase(config, diff, staged_files, missing_hint=None):
+    """Two-phase approach for large diffs with many files.
+
+    ``diff`` is the already-computed unified diff; we parse it once into a
+    per-file cache so phase-2 group slicing is an in-memory dict lookup
+    instead of re-running ``git diff`` per group.
+    """
     excludes = build_pathspec_excludes()
     name_status, _, _ = run(["git", "diff", "--cached", "--name-status", "-M", "--", "."] + excludes)
     stat, _, _ = run(["git", "diff", "--cached", "--stat", "--", "."] + excludes)
+    diff_by_file = parse_diff_by_file(diff)
 
     path_ctx = compute_path_context(staged_files.keys())
     phase1_content = f"{path_ctx}FILE CHANGES:\n{name_status}\nSTATISTICS:\n{stat}"
@@ -1239,9 +1398,9 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
     else:
         log("INFO", "phase 1: sending file summary to LLM", {"chars": len(phase1_content)})
         if _spinner:
-            _spinner.set("Grouping files...")
+            _spinner.set(f"Grouping files ({len(staged_files)})")
         try:
-            groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content)
+            groups = call_llm_raw(config, PHASE1_PROMPT, phase1_content, task_label="phase1-grouping")
         except ContextLengthExceeded:
             warn("LLM context length exceeded, falling back to directory grouping")
             groups = group_files_by_directory(staged_files)
@@ -1281,7 +1440,11 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
         if not normalized:
             continue
 
-        group_diff = get_diff_for_files(normalized)
+        group_diff = slice_diff_by_file(diff_by_file, normalized)
+        if not group_diff.strip():
+            # Fall back to shelling out if the file wasn't in the parsed
+            # cache (e.g. encoding edge cases). Rare.
+            group_diff = get_diff_for_files(normalized)
         if not group_diff.strip():
             continue
 
@@ -1294,26 +1457,46 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
 
     # Run all phase 2 LLM calls in parallel
     if llm_tasks:
+        total_tasks = len(llm_tasks)
+        done_count = [0]
+        log("INFO", "phase 2: sending groups to LLM in parallel", {"groups": total_tasks})
+
+        def _phase2_msg():
+            snap = _timings.snapshot()
+            done = done_count[0]
+            inflight = snap["inflight"]
+            recent = snap["durations"][-10:]
+            avg = sum(recent) / len(recent) if recent else 0.0
+            remaining = total_tasks - done
+            if avg and inflight and remaining > 0:
+                eta = avg * remaining / max(inflight, 1)
+                eta_str = f" · ~{eta:.0f}s left"
+            else:
+                eta_str = ""
+            slowest = f" · slowest {max(recent):.0f}s" if recent else ""
+            return (
+                f"Writing commit messages {done}/{total_tasks}"
+                f" · {inflight} in flight{eta_str}{slowest}"
+            )
+
         if _spinner:
-            _spinner.set(f"Writing {len(llm_tasks)} commit messages...")
-        log("INFO", "phase 2: sending groups to LLM in parallel", {"groups": len(llm_tasks)})
+            _spinner.set_dynamic(_phase2_msg)
 
         def _phase2_call(task):
             idx, normalized, content = task
             log("INFO", "phase 2: sending diff to LLM", {"group": idx + 1, "chars": len(content), "files": len(normalized)})
             try:
-                result = call_llm_raw(config, PHASE2_PROMPT, content)
+                result = call_llm_raw(
+                    config, PHASE2_PROMPT, content, task_label=f"group {idx + 1}"
+                )
             except ContextLengthExceeded:
                 return (idx, "context_exceeded", normalized)
             return (idx, result, normalized)
 
-        with ThreadPoolExecutor(max_workers=min(len(llm_tasks), 4)) as executor:
+        with ThreadPoolExecutor(max_workers=min(total_tasks, PHASE2_MAX_PARALLEL)) as executor:
             futures = {executor.submit(_phase2_call, t): t for t in llm_tasks}
-            done_count = 0
             for future in as_completed(futures):
-                done_count += 1
-                if _spinner:
-                    _spinner.set(f"Writing commit messages ({done_count}/{len(llm_tasks)})...")
+                done_count[0] += 1
                 idx, result, normalized = future.result()
 
                 if result == "context_exceeded":
@@ -1431,8 +1614,8 @@ def generate_commit_plan(config, args, diff, staged_files):
 
     for attempt in range(1, MAX_LLM_RETRIES + 1):
         if file_count > LARGE_DIFF_FILES:
-            _spinner.set("Grouping files...")
-            raw_commits = call_llm_two_phase(config, staged_files, missing_hint=missing_hint)
+            _spinner.set(f"Grouping files ({file_count})")
+            raw_commits = call_llm_two_phase(config, diff, staged_files, missing_hint=missing_hint)
         else:
             label = f"Analysing {file_count} files"
             if attempt > 1:
@@ -1649,11 +1832,13 @@ def main():
 
     _spinner = Spinner()
     try:
-        _spinner.set("Staging changes...")
+        _timings.phase_start("stage")
+        _spinner.set(f"[{config['MODEL']}] Staging changes")
         diff, source = get_diff()
         if not diff:
             if source == "all":
                 run(["git", "reset", "HEAD", "--", "."])
+            _timings.phase_end("stage")
             sprint("nothing to commit")
             return
 
@@ -1661,12 +1846,14 @@ def main():
         if not staged_files:
             if source == "all":
                 run(["git", "reset", "HEAD", "--", "."])
+            _timings.phase_end("stage")
             sprint("nothing to commit")
             return
 
         lockfiles = get_lockfiles_in_staging()
         file_count = len(staged_files)
         _spinner.ok(f"Staged {file_count} file{'s' if file_count != 1 else ''}")
+        _timings.phase_end("stage")
 
         audit("start", {
             "source": source,
@@ -1675,7 +1862,9 @@ def main():
             "lockfiles": lockfiles,
         })
 
+        _timings.phase_start("plan")
         commits = generate_commit_plan(config, args, diff, staged_files)
+        _timings.phase_end("plan")
         if not commits:
             exit_with_error("no valid commits generated", {"file_count": file_count})
 
@@ -1687,7 +1876,9 @@ def main():
             audit("dry_run", {"commits": len(commits)})
             return
 
+        _timings.phase_start("commit")
         failed_commits = execute_commits(commits, lockfiles, staged_files, args.no_verify)
+        _timings.phase_end("commit")
 
         if failed_commits:
             warn(f"{len(failed_commits)} commit(s) failed: {', '.join(failed_commits)}")
@@ -1698,10 +1889,14 @@ def main():
             sprint("done (push skipped)")
             return
 
+        _timings.phase_start("push")
         push_to_remote()
+        _timings.phase_end("push")
         log("INFO", "session completed successfully")
     finally:
         _spinner.stop()
+        log("INFO", "timings", {"summary": _timings.summary_line()})
+        sprint(_dim(f"  {_timings.summary_line()}"))
 
 
 if __name__ == "__main__":
