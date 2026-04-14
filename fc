@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -268,10 +269,17 @@ SCOPE_GUIDANCE = (
     "Always include a scope — omit only for truly root-level config files."
 )
 
+DESCRIPTION_GUIDANCE = (
+    "The description is the commit body. It must explain WHAT changed and WHY, not just restate the subject. "
+    "Cover: what behavior/logic changed, why the change was needed, and any non-obvious consequences. "
+    "Use 1-4 concise sentences. Never leave it empty or repeat the subject line."
+)
+
 SYSTEM_PROMPT = f"""Group git diff into atomic commits. Every file MUST appear in exactly one commit.
-Output JSON array: [{{"files":["path/to/file"],"message":"type(scope): subject","description":"why"}}]
+Output JSON array: [{{"files":["path/to/file"],"message":"type(scope): subject","description":"commit body"}}]
 Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
 {SCOPE_GUIDANCE}
+{DESCRIPTION_GUIDANCE}
 Use REAL file paths from the diff and REAL commit messages. Output ONLY valid JSON, no markdown."""
 
 PHASE1_PROMPT = """Group changed files into logical atomic commits by analyzing file paths and change types.
@@ -279,9 +287,10 @@ Output JSON array: [{"files":["path/to/file"],"hint":"what changed"}]
 Use REAL file paths from the list below. Output ONLY valid JSON, no markdown."""
 
 PHASE2_PROMPT = f"""Generate ONE commit message for this diff.
-Output JSON object: {{"message":"type(scope): subject","description":"why"}}
+Output JSON object: {{"message":"type(scope): subject","description":"commit body"}}
 Types: feat|fix|refactor|chore|docs|style|test|perf. Subject: imperative, <=50 chars, no period.
 {SCOPE_GUIDANCE}
+{DESCRIPTION_GUIDANCE}
 Output ONLY valid JSON, no markdown."""
 
 # Directories that are monorepo containers — scope should be the child (project name)
@@ -441,7 +450,7 @@ MAX_DIFF_CHARS = 20000
 MAX_LINES_PER_HUNK = 15
 MAX_HUNKS_PER_FILE = 5
 LARGE_DIFF_FILES = 15
-MAX_OUTPUT_TOKENS = 4096
+MAX_OUTPUT_TOKENS = 8192
 # Beyond this many files, skip LLM entirely and use bulk commit
 BULK_FILE_THRESHOLD = 200
 # Maximum characters for phase 1 file summary before fallback
@@ -912,19 +921,20 @@ def call_llm_raw(config, system_prompt, user_content):
         request_body["response_format"] = {"type": "json_object"}
 
     wall_clock_timeout = 90
+    is_main_thread = threading.current_thread() is threading.main_thread()
 
     def _alarm_handler(signum, frame):
         raise _LLMWallClockTimeout()
 
     old_alarm_handler = None
-    if _HAS_SIGALRM:
+    if _HAS_SIGALRM and is_main_thread:
         old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_handler)
 
     resp = None
     try:
         for attempt in range(MAX_RETRIES):
             try:
-                if _HAS_SIGALRM:
+                if _HAS_SIGALRM and is_main_thread:
                     signal.alarm(wall_clock_timeout)
                 resp = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -933,7 +943,7 @@ def call_llm_raw(config, system_prompt, user_content):
                         "Content-Type": "application/json",
                     },
                     json=request_body,
-                    timeout=(10, 60),
+                    timeout=(10, wall_clock_timeout),
                 )
                 if resp.status_code == 200:
                     break
@@ -960,10 +970,10 @@ def call_llm_raw(config, system_prompt, user_content):
                     {"model": config["MODEL"], "attempts": MAX_RETRIES}
                 )
             finally:
-                if _HAS_SIGALRM:
+                if _HAS_SIGALRM and is_main_thread:
                     signal.alarm(0)
     finally:
-        if _HAS_SIGALRM:
+        if _HAS_SIGALRM and is_main_thread:
             signal.alarm(0)
             if old_alarm_handler is not None:
                 signal.signal(signal.SIGALRM, old_alarm_handler)
@@ -981,6 +991,11 @@ def call_llm_raw(config, system_prompt, user_content):
     except (KeyError, IndexError) as e:
         exit_with_error(
             f"unexpected API response structure: {e}",
+            {"response_json": str(resp_json)[:1000], "model": config["MODEL"]}
+        )
+    if content is None:
+        exit_with_error(
+            "LLM returned null content",
             {"response_json": str(resp_json)[:1000], "model": config["MODEL"]}
         )
     content = content.strip()
@@ -1017,8 +1032,9 @@ def call_llm_raw(config, system_prompt, user_content):
 RETRY_PROMPT = f"""Previous output was rejected. Use REAL file paths from the diff and REAL commit messages.
 Every file MUST appear in exactly one commit.
 {SCOPE_GUIDANCE}
+{DESCRIPTION_GUIDANCE}
 Output ONLY valid JSON array:
-[{{"files":["real/path.go"],"message":"feat(scope): real subject","description":"real reason"}}]"""
+[{{"files":["real/path.go"],"message":"feat(scope): real subject","description":"what changed and why"}}]"""
 
 
 def is_malformed_response(result):
@@ -1240,7 +1256,10 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
     if not groups:
         groups = group_files_by_directory(staged_files)
 
+    # Separate groups that already have messages from those needing LLM
     commits = []
+    llm_tasks = []  # (index, normalized_files)
+
     for i, group in enumerate(groups):
         if not isinstance(group, dict):
             continue
@@ -1251,58 +1270,82 @@ def call_llm_two_phase(config, staged_files, missing_hint=None):
         if group.get("message"):
             normalized = normalize_llm_files(files, staged_files) if isinstance(files[0], str) else files
             if normalized:
-                commits.append({
+                commits.append((i, {
                     "files": normalized,
                     "message": group["message"],
                     "description": group.get("description", ""),
-                })
+                }))
             continue
 
         normalized = normalize_llm_files(files, staged_files)
         if not normalized:
             continue
 
-        if _spinner:
-            _spinner.set(f"Writing message {i + 1}/{len(groups)}...")
         group_diff = get_diff_for_files(normalized)
         if not group_diff.strip():
             continue
-        content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff)
+
+        max_group_chars = 30000
+        content = group_diff if len(group_diff) <= MAX_DIFF_CHARS else compress_diff(group_diff, max_chars=max_group_chars)
         group_ctx = compute_path_context(normalized)
         if group_ctx:
             content = group_ctx + "\n" + content
-        log("INFO", "phase 2: sending diff to LLM", {"group": i + 1, "chars": len(content), "files": len(normalized)})
+        llm_tasks.append((i, normalized, content))
 
-        try:
-            result = call_llm_raw(config, PHASE2_PROMPT, content)
-        except ContextLengthExceeded:
-            warn(f"context length exceeded for group {i + 1}, using smart analysis")
-            commits.extend(_smart_fallback_commits(normalized, staged_files))
-            continue
+    # Run all phase 2 LLM calls in parallel
+    if llm_tasks:
+        if _spinner:
+            _spinner.set(f"Writing {len(llm_tasks)} commit messages...")
+        log("INFO", "phase 2: sending groups to LLM in parallel", {"groups": len(llm_tasks)})
 
-        if isinstance(result, list) and len(result) > 0:
-            result = result[0]
-        if not isinstance(result, dict):
-            warn(f"phase 2 returned non-dict for group {i + 1}, using smart analysis")
-            commits.extend(_smart_fallback_commits(normalized, staged_files))
-            continue
+        def _phase2_call(task):
+            idx, normalized, content = task
+            log("INFO", "phase 2: sending diff to LLM", {"group": idx + 1, "chars": len(content), "files": len(normalized)})
+            try:
+                result = call_llm_raw(config, PHASE2_PROMPT, content)
+            except ContextLengthExceeded:
+                return (idx, "context_exceeded", normalized)
+            return (idx, result, normalized)
 
-        message = result.get("message")
-        if not message or message.lower() in ("message", ""):
-            warn(f"phase 2 missing message for group {i + 1}, using smart analysis")
-            fallback = _smart_fallback_commits(normalized, staged_files)
-            if fallback:
-                commits.extend(fallback)
-                continue
-            message = f"chore: update {len(normalized)} files"
+        with ThreadPoolExecutor(max_workers=min(len(llm_tasks), 4)) as executor:
+            futures = {executor.submit(_phase2_call, t): t for t in llm_tasks}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                if _spinner:
+                    _spinner.set(f"Writing commit messages ({done_count}/{len(llm_tasks)})...")
+                idx, result, normalized = future.result()
 
-        description = result.get("description", "")
-        if description.lower() == "description":
-            description = ""
+                if result == "context_exceeded":
+                    warn(f"context length exceeded for group {idx + 1}, using smart analysis")
+                    commits.extend((idx, c) for c in _smart_fallback_commits(normalized, staged_files))
+                    continue
 
-        commits.append(_ensure_grounded_scope({"files": normalized, "message": _clean_commit_message(message), "description": description}))
+                if isinstance(result, list) and len(result) > 0:
+                    result = result[0]
+                if not isinstance(result, dict):
+                    warn(f"phase 2 returned non-dict for group {idx + 1}, using smart analysis")
+                    commits.extend((idx, c) for c in _smart_fallback_commits(normalized, staged_files))
+                    continue
 
-    return commits
+                message = result.get("message")
+                if not message or message.lower() in ("message", ""):
+                    warn(f"phase 2 missing message for group {idx + 1}, using smart analysis")
+                    fallback = _smart_fallback_commits(normalized, staged_files)
+                    if fallback:
+                        commits.extend((idx, c) for c in fallback)
+                        continue
+                    message = f"chore: update {len(normalized)} files"
+
+                description = result.get("description", "")
+                if description.lower() == "description":
+                    description = ""
+
+                commits.append((idx, _ensure_grounded_scope({"files": normalized, "message": _clean_commit_message(message), "description": description})))
+
+    # Sort by original group index to preserve logical ordering
+    commits.sort(key=lambda x: x[0])
+    return [c for _, c in commits]
 
 
 def get_lockfiles_in_staging():
