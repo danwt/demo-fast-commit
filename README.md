@@ -83,6 +83,7 @@ The tool will:
 | `MODEL` | Model to use (required for the default provider). Any model on OpenRouter works. |
 | `STRUCTURED_OUTPUT` | Set to `false` to disable JSON mode (default: `true`) |
 | `CLAUDE_MODEL` | Model for `--provider claude` (default: `haiku`) |
+| `CLAUDE_ONLY_REMOTES` | Comma-separated substrings. If any git remote URL contains one, the provider defaults to `claude` and `--provider openrouter` is refused |
 
 ## Providers
 
@@ -135,7 +136,7 @@ These files are excluded from LLM analysis (but still committed):
 ## Testing
 
 ```bash
-uv run --with pytest pytest test_fc.py -v
+uv run --with pytest --with requests --with truststore pytest test_fc.py -v
 ```
 
 ## Claude Code integration

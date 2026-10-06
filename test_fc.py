@@ -817,3 +817,24 @@ class TestEnsureGroundedScope:
         commit = {"files": ["apps/grupeta/a.ts"], "message": "WIP stuff"}
         result = _ensure_grounded_scope(commit)
         assert result["message"] == "WIP stuff"
+
+
+class TestResolveProvider:
+    REMOTES = "origin\tgit@github.com:acme-corp/app.git (fetch)\n"
+
+    @pytest.fixture(autouse=True)
+    def _remotes(self, monkeypatch):
+        monkeypatch.setattr(_mod, "run", lambda cmd, **kw: (self.REMOTES, "", 0))
+
+    def test_default_without_patterns(self):
+        assert _mod.resolve_provider(None, {}) == "openrouter"
+
+    def test_match_defaults_to_claude(self):
+        assert _mod.resolve_provider(None, {"CLAUDE_ONLY_REMOTES": "other, acme-corp"}) == "claude"
+
+    def test_match_refuses_openrouter(self):
+        with pytest.raises(SystemExit):
+            _mod.resolve_provider("openrouter", {"CLAUDE_ONLY_REMOTES": "acme-corp"})
+
+    def test_no_match_keeps_request(self):
+        assert _mod.resolve_provider("openrouter", {"CLAUDE_ONLY_REMOTES": "other"}) == "openrouter"

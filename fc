@@ -504,7 +504,22 @@ def compute_path_context(file_paths):
 # Config + git helpers
 # ---------------------------------------------------------------------------
 
-def load_config(provider):
+def resolve_provider(requested, config):
+    """Force the claude provider in repos whose remotes match CLAUDE_ONLY_REMOTES."""
+    patterns = [p.strip() for p in config.get("CLAUDE_ONLY_REMOTES", "").split(",") if p.strip()]
+    remotes, _, _ = run(["git", "remote", "-v"])
+    match = next((p for p in patterns if p in remotes), None)
+    if match is None:
+        return requested or PROVIDER_OPENROUTER
+    if requested == PROVIDER_OPENROUTER:
+        exit_with_error(
+            f"remote matches CLAUDE_ONLY_REMOTES ({match}): only --provider claude is allowed",
+            {"pattern": match}
+        )
+    return PROVIDER_CLAUDE
+
+
+def load_config(requested):
     if not CONFIG_PATH.exists():
         exit_with_error(
             f"config not found at {CONFIG_PATH}. Create it with OPENROUTER_API_KEY and MODEL",
@@ -518,6 +533,7 @@ def load_config(provider):
         key, _, value = line.partition("=")
         config[key.strip()] = value.strip().strip("\"'")
 
+    provider = resolve_provider(requested, config)
     config["PROVIDER"] = provider
     if provider == PROVIDER_OPENROUTER:
         if "OPENROUTER_API_KEY" not in config:
@@ -2015,8 +2031,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="preview commits without executing")
     parser.add_argument("--no-push", action="store_true", help="skip automatic push")
     parser.add_argument("--bulk", action="store_true", help="skip LLM, use smart file tree analysis (for large batches)")
-    parser.add_argument("--provider", choices=PROVIDERS, default=PROVIDER_OPENROUTER,
-                        help="where to send prompts (default: openrouter)")
+    parser.add_argument("--provider", choices=PROVIDERS,
+                        help="where to send prompts (default: openrouter, or claude in CLAUDE_ONLY_REMOTES repos)")
     args = parser.parse_args()
 
     log("INFO", "session started", {"dry_run": args.dry_run, "no_verify": args.no_verify, "no_push": args.no_push, "bulk": args.bulk, "provider": args.provider})
