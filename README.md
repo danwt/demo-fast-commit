@@ -43,8 +43,8 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 # Clone and symlink (use absolute path)
-git clone https://github.com/danwt/demo-fast-commit.git
-cd demo-fast-commit && ln -s "$(pwd)/fc" ~/.local/bin/fastc && cd ..
+git clone https://github.com/danwt/fast-commit.git
+cd fast-commit && ln -s "$(pwd)/fc" ~/.local/bin/fastc && cd ..
 
 # Create config
 mkdir -p ~/.config/fast-commit
